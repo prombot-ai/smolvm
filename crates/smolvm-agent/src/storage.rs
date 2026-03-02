@@ -31,6 +31,10 @@ const OVERLAYS_DIR: &str = "overlays";
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Global state for boot-time volume mounts.
+/// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
+static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
+
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
 /// Returns the mount point path if successfully mounted.
@@ -94,6 +98,67 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
+}
+
+/// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
+///
+/// The host launcher sets:
+///   SMOLVM_MOUNT_COUNT=N
+///   SMOLVM_MOUNT_0=smolvm0:/data:rw
+///   SMOLVM_MOUNT_1=smolvm1:/config:ro
+///
+/// This mounts each virtiofs device at its staging area and bind-mounts
+/// to the guest target path, making volumes visible to all code paths
+/// including VmExec.
+pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
+    BOOT_VOLUME_MOUNTS.get_or_init(|| {
+        let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
+            Ok(v) => match v.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    warn!(value = %v, "invalid SMOLVM_MOUNT_COUNT");
+                    return Vec::new();
+                }
+            },
+            Err(_) => return Vec::new(),
+        };
+
+        let mut mounts = Vec::with_capacity(count);
+        for i in 0..count {
+            let env_key = format!("SMOLVM_MOUNT_{}", i);
+            let env_val = match std::env::var(&env_key) {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(key = %env_key, "missing mount env var");
+                    continue;
+                }
+            };
+
+            // Parse "tag:guest_path:ro|rw"
+            let parts: Vec<&str> = env_val.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                warn!(key = %env_key, value = %env_val, "invalid mount format, expected tag:path:ro|rw");
+                continue;
+            }
+
+            let tag = parts[0].to_string();
+            let guest_path = parts[1].to_string();
+            let read_only = parts[2] == "ro";
+
+            info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
+            mounts.push((tag, guest_path, read_only));
+        }
+
+        // Mount using existing logic with empty rootfs prefix so bind mounts
+        // go to absolute guest paths (e.g., "/data"), visible to VmExec.
+        if !mounts.is_empty() {
+            if let Err(e) = setup_volume_mounts("", &mounts) {
+                warn!(error = %e, "failed to setup boot volume mounts");
+            }
+        }
+
+        mounts
+    })
 }
 
 /// Create a synthetic ImageInfo from packed layers.

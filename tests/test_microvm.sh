@@ -491,6 +491,46 @@ test_db_default_vm_state_transitions() {
 }
 
 # =============================================================================
+# Volume Mounts
+# =============================================================================
+
+test_microvm_volume_mount_visible_to_exec() {
+    local vm_name="test-vm-volmnt"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create a host directory with a test file
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "volume-mount-marker-54321" > "$tmpdir/testfile.txt"
+
+    # Create and start VM with volume mount
+    $SMOLVM microvm create "$vm_name" -v "$tmpdir:/mnt/hostdata" 2>&1 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    $SMOLVM microvm start "$vm_name" 2>&1 || {
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    # Read the file via microvm exec (VmExec) — this exercises boot-time mount
+    local output
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /mnt/hostdata/testfile.txt 2>&1)
+
+    # Cleanup
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ "$output" == *"volume-mount-marker-54321"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -515,5 +555,6 @@ run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true
 run_test "Overlay: root is overlayfs" test_microvm_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_microvm_rootfs_persists_across_reboot || true
+run_test "Volume: mount visible to exec" test_microvm_volume_mount_visible_to_exec || true
 
 print_summary "MicroVM Tests"
