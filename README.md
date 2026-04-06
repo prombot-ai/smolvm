@@ -13,9 +13,9 @@ smolvm
 
 Ship and run software with isolation by default.
 
-This is cli tool that lets you:
-1. Manage and run custom linux virtual machine locally with: subsecond coldstart, cross-platform (macOS,Linux), elastic memory usage.
-2. Pack a stateful virtual machine into a single file (.smolmachine) to rehydrate on any supported platforms.
+This is a cli tool that lets you:
+1. Run a custom linux virtual machine locally with subsecond coldstart, cross-platform support on macOS and linux, and dynamic memory right-sizing.
+2. Pack a stateful virtual machine into a single .smolmachine artifact to rehydrate and run like an executable binary on any supported platform.
 
 Install
 -------
@@ -31,7 +31,7 @@ Quick Start
 
 ```bash
 # run a command in an ephemeral VM (cleaned up after exit)
-smolvm machine run --net --image alpine -- echo "hello from a microVM"
+smolvm machine run --net --image alpine -- sh -c "echo 'hello from a microVM' && uname -a"
 
 # interactive shell
 smolvm machine run --net -it --image alpine -- /bin/sh
@@ -43,19 +43,24 @@ Use This For
 **Sandbox untrusted code** — run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-smolvm machine run --net --image alpine -- sh -c "pip install sketchy-package"
-# runs in its own kernel — can't touch your host filesystem or network
+# network is off by default — untrusted code can't phone home
+smolvm machine run --image alpine -- ping -c 1 1.1.1.1
+# fails — no network access
 
 # lock down egress — only allow specific hosts
-smolvm machine run --allow-host registry.npmjs.org --image node:20-alpine -- npm install
-# npm install works, but malicious postinstall scripts can't phone home
+smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://registry.npmjs.org
+# works — allowed host
+
+smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -q -O /dev/null https://google.com
+# fails — not in allow list
 ```
 
-**Pack into portable executables** — turn any workload into a self-contained binary.
+**Pack into portable executables** — turn any workload into a self-contained binary. All dependencies are pre-baked — no install step, no runtime downloads, boots in <200ms.
 
 ```bash
-smolvm pack create --image python:3.12-alpine -o ./my-app
-./my-app run -- python3 -c "print('runs anywhere — no dependencies')"
+smolvm pack create --image python:3.12-alpine -o ./python312
+./python312 run -- python3 --version
+# Python 3.12.x — isolated, no pyenv/venv/conda needed
 ```
 
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
@@ -65,7 +70,7 @@ smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
-# try: sl, ls, uname -a — type 'exit' to leave
+# inside: sl, ls, uname -a — type 'exit' to leave
 smolvm machine stop --name myvm
 ```
 
@@ -144,7 +149,5 @@ Development
 -----------
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-
-> Alpha — APIs may change.
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)

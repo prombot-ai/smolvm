@@ -908,7 +908,7 @@ struct PackedExecArgs {
 /// Never returns — calls `std::process::exit()`.
 pub fn run_as_packed_binary(mode: PackedMode) -> ! {
     // Use argv[0] as the binary name so --help and --version display
-    // "my-app 0.2.0" instead of "smolvm 0.2.0".
+    // "my-app 0.5.1" instead of "smolvm 0.5.1".
     let bin_name = std::env::args()
         .next()
         .and_then(|a| {
