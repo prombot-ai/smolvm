@@ -62,10 +62,8 @@ fn main() {
 
     tracing::debug!(version = smolvm::VERSION, "starting smolvm");
 
-    // Clean up stale ephemeral VM records from previous crashes.
-    cli::vm_common::cleanup_orphaned_ephemeral_vms();
-
     // Execute command
+    // Note: orphan cleanup is handled per-command (skipped for ephemeral `machine run`).
     let result = match cli.command {
         Commands::Machine(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
@@ -87,12 +85,18 @@ fn main() {
 /// JSON mode is enabled via `SMOLVM_LOG_FORMAT=json` env var or when
 /// running as `smolvm serve --json-logs`. Default is human-readable.
 fn init_logging() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("smolvm=warn"));
-
     let json = std::env::var("SMOLVM_LOG_FORMAT")
         .map(|v| v == "json")
         .unwrap_or(false);
+
+    // Skip EnvFilter::try_from_default_env() when RUST_LOG is not set —
+    // avoids parsing an env var that doesn't exist.
+    let filter = match std::env::var_os("RUST_LOG") {
+        Some(_) => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("smolvm=warn"))
+        }
+        None => EnvFilter::new("smolvm=warn"),
+    };
 
     if json {
         tracing_subscriber::fmt()

@@ -110,6 +110,13 @@ pub enum MachineCmd {
 
 impl MachineCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // Skip orphan cleanup for ephemeral `machine run` — it creates and
+        // immediately destroys its VM, so stale records don't affect it.
+        // Other commands (ls, exec, create, etc.) clean up first.
+        if !matches!(self, MachineCmd::Run(_)) {
+            super::vm_common::cleanup_orphaned_ephemeral_vms();
+        }
+
         match self {
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),
