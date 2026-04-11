@@ -15,9 +15,36 @@ use smolvm_protocol::{
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
 mod crun;
+
+/// Ensures storage disk is mounted exactly once. The mount happens either during
+/// deferred init (the common case) or on the first request that needs storage
+/// (if a request arrives before deferred init reaches the mount step).
+/// This eliminates the race between early ready signaling and storage access.
+static STORAGE_MOUNTED: OnceLock<bool> = OnceLock::new();
+
+fn ensure_storage_mounted() -> bool {
+    *STORAGE_MOUNTED.get_or_init(|| {
+        let t0 = uptime_ms();
+        let ok = mount_storage_disk();
+        // Log after tracing may or may not be initialized — use boot_log for safety.
+        if ok {
+            boot_log(
+                "INFO",
+                &format!("storage disk mounted (duration_ms={})", uptime_ms() - t0),
+            );
+        } else {
+            boot_log(
+                "ERROR",
+                "storage disk NOT mounted — image pulls and container overlays will fail",
+            );
+        }
+        ok
+    })
+}
 
 /// Format a structured JSON log line for early boot (before tracing is up).
 fn format_boot_log(level: &str, msg: &str) -> String {
@@ -107,11 +134,22 @@ fn main() {
         }
     };
 
+    // Set up signal handlers for graceful shutdown (sync before exit)
+    setup_signal_handlers();
+
+    // Signal readiness to host IMMEDIATELY after vsock listener is active.
+    // The host detects this marker, then connects and sends its first request.
+    // That connection takes ~10-30ms, giving us time to finish deferred init
+    // below before the first request arrives.
+    signal_ready_to_host();
+
+    // --- Deferred init: runs while host is detecting marker + connecting ---
+    // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
+    // happens exactly once — either here or on first storage-dependent request.
+
     let start_uptime = uptime_ms();
 
-    // Initialize logging (after vsock listener is ready).
-    // JSON format for machine consumption (agent-console.log is read by host).
-    // Default level: info — captures lifecycle events without debug noise.
+    // Initialize logging (deferred past ready signal — uses boot_log before this).
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -126,19 +164,9 @@ fn main() {
         "smolvm-agent started, vsock listener already ready"
     );
 
-    // Set up signal handlers for graceful shutdown (sync before exit)
-    setup_signal_handlers();
-
-    // Mount storage disk (moved from init script for faster vsock availability)
-    let t0 = uptime_ms();
-    if mount_storage_disk() {
-        info!(duration_ms = uptime_ms() - t0, "storage disk mounted");
-    } else {
-        error!(
-            duration_ms = uptime_ms() - t0,
-            "storage disk NOT mounted — image pulls and container overlays will fail"
-        );
-    }
+    // Mount storage disk eagerly during deferred init. If a request arrives
+    // before this point, ensure_storage_mounted() handles the mount on demand.
+    ensure_storage_mounted();
 
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
@@ -183,13 +211,8 @@ fn main() {
     info!(
         total_startup_ms = uptime_ms() - start_uptime,
         uptime_ms = uptime_ms(),
-        "agent startup complete, entering accept loop"
+        "agent init complete, entering accept loop"
     );
-
-    // Signal readiness to host via virtiofs marker file.
-    // The host watches for this file instead of the vsock socket (which appears
-    // before the agent is ready, causing wasted timeout on the first ping).
-    signal_ready_to_host();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
@@ -414,8 +437,11 @@ fn setup_persistent_rootfs() {
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
     // on a mounted device fails with "Resource busy" — must resize first.
+    // Skip if filesystem already fills the device (subsequent boots).
     // If resize fails (macOS-created template), the mount+mkfs fallback below handles it.
-    let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    if !ext4_already_full_size(OVERLAY_DEVICE) {
+        let _ = resize_ext4_if_needed(OVERLAY_DEVICE, "overlay");
+    }
 
     // Try to mount overlay disk (should be pre-formatted ext4)
     let dev = cstr(OVERLAY_DEVICE);
@@ -472,9 +498,12 @@ fn setup_persistent_rootfs() {
         let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
         Some(std::thread::spawn(|| {
             // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
             // If resize fails (e.g. macOS-created template with incompatible features),
             // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !resize_ext4_if_needed(STORAGE_DEVICE, "storage") {
+            if !ext4_already_full_size(STORAGE_DEVICE)
+                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            {
                 boot_log(
                     "WARN",
                     "storage: resize failed, deferring to mount_storage_disk",
@@ -715,65 +744,167 @@ fn setup_signal_handlers() {
 /// MUST be called BEFORE mounting — resize2fs on a mounted device fails with
 /// "Resource busy" because the kernel holds the block device exclusively.
 ///
-/// Runs `e2fsck -f` first because resize2fs requires a clean filesystem.
+/// Tries resize2fs directly first. Only falls back to e2fsck if resize2fs
+/// fails (e.g., due to actual corruption). ext4 journal replay handles
+/// `needs_recovery` on mount in ~1-2ms, so a full e2fsck is unnecessary
+/// on the happy path. Uses boot_log instead of tracing because this runs
+/// before tracing_subscriber is initialized.
 fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
     use std::process::Command;
 
-    // e2fsck -f is required before resize2fs — without it, resize2fs
-    // refuses to run ("Please run e2fsck first"). The -y flag auto-fixes
-    // any errors, -f forces check even if filesystem appears clean.
-    match Command::new("e2fsck").args(["-f", "-y", device]).output() {
-        Ok(output) => {
-            let code = output.status.code().unwrap_or(-1);
-            // e2fsck exit codes:
-            //   0 = clean, 1 = errors fixed, 2 = errors fixed + reboot needed
-            //   4 = errors left uncorrected, 8 = operational error
-            // Codes >= 4 mean the filesystem is not trustworthy — skip resize.
-            if code >= 4 {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
-                    "{} e2fsck could not repair filesystem (exit {}): {}",
-                    label,
-                    code,
-                    stderr.trim()
-                );
-                return false;
-            }
-            if code > 0 {
-                tracing::info!("{} e2fsck fixed errors (exit {})", label, code);
-            }
-        }
-        Err(e) => {
-            tracing::warn!("{} e2fsck not found: {}", label, e);
-            return false;
-        }
-    }
-
+    // Try resize2fs directly — skip e2fsck on the happy path.
+    // ext4 journal replay handles needs_recovery on mount, so resize2fs
+    // usually succeeds without a prior fsck.
     match Command::new("resize2fs").arg(device).output() {
         Ok(output) if output.status.success() => {
             let msg = String::from_utf8_lossy(&output.stderr);
             if msg.contains("Nothing to do") {
-                tracing::debug!("{} filesystem already at full device size", label);
+                boot_log(
+                    "DEBUG",
+                    &format!("{} filesystem already at full device size", label),
+                );
             } else {
-                tracing::info!("{} filesystem resized to fill block device", label);
+                boot_log(
+                    "INFO",
+                    &format!("{} filesystem resized to fill block device", label),
+                );
             }
+            return true;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            boot_log(
+                "WARN",
+                &format!(
+                    "{} resize2fs failed (exit {}): {}, trying e2fsck",
+                    label,
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
+            );
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} resize2fs not found: {}", label, e));
+            return false;
+        }
+    }
+
+    // Fallback: resize2fs failed, run e2fsck -y (without -f) then retry.
+    // Without -f, e2fsck skips clean filesystems instantly. With needs_recovery,
+    // it replays the journal (~10ms) instead of a full forced scan (~128ms).
+    match Command::new("e2fsck").args(["-y", device]).output() {
+        Ok(output) => {
+            let code = output.status.code().unwrap_or(-1);
+            // e2fsck exit codes (bit flags, may be OR'd together):
+            //   0 = clean
+            //   1 = errors corrected
+            //   2 = errors corrected, reboot needed (unsafe to proceed)
+            //   4 = errors left uncorrected
+            //   8 = operational error
+            if code >= 2 {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "{} e2fsck could not fully repair (exit {}): {}",
+                        label,
+                        code,
+                        stderr.trim()
+                    ),
+                );
+                return false;
+            }
+            if code == 1 {
+                boot_log("INFO", &format!("{} e2fsck fixed errors", label));
+            }
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("{} e2fsck not found: {}", label, e));
+            return false;
+        }
+    }
+
+    // Retry resize2fs after e2fsck
+    match Command::new("resize2fs").arg(device).output() {
+        Ok(output) if output.status.success() => {
+            boot_log(
+                "INFO",
+                &format!("{} filesystem resized after e2fsck", label),
+            );
             true
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(
-                "{} resize2fs failed (exit {}): {}",
-                label,
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
+            boot_log(
+                "WARN",
+                &format!(
+                    "{} resize2fs still failed after e2fsck (exit {}): {}",
+                    label,
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim()
+                ),
             );
             false
         }
         Err(e) => {
-            tracing::warn!("{} resize2fs not found or failed to execute: {}", label, e);
+            boot_log("WARN", &format!("{} resize2fs failed: {}", label, e));
             false
         }
     }
+}
+
+/// Check if ext4 filesystem already fills the block device.
+///
+/// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
+/// then compares against the device size. Returns true if the filesystem already
+/// spans the full device, meaning resize2fs would be a no-op. This avoids the
+/// ~5ms cost of spawning resize2fs on every subsequent boot.
+///
+/// Returns false (conservative, triggers resize path) on any error: unformatted
+/// device, non-ext4 filesystem, corrupt superblock, or I/O failure.
+fn ext4_already_full_size(device: &str) -> bool {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match File::open(device) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // For block devices, metadata().len() returns 0. Use seek to find size.
+    let dev_size = match f.seek(SeekFrom::End(0)) {
+        Ok(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ext4 superblock starts at byte offset 1024. We need:
+    //   offset  4: s_blocks_count_lo (4 bytes)
+    //   offset 24: s_log_block_size  (4 bytes)
+    //   offset 56: s_magic           (2 bytes) — must be 0xEF53
+    let mut sb = [0u8; 64];
+    if f.seek(SeekFrom::Start(1024)).is_err() || f.read_exact(&mut sb).is_err() {
+        return false;
+    }
+
+    // Validate ext4 magic number before trusting any fields.
+    let magic = u16::from_le_bytes([sb[56], sb[57]]);
+    if magic != 0xEF53 {
+        return false;
+    }
+
+    let log_block_size = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]);
+    // Sanity check: log_block_size > 6 means block_size > 64 MB, not valid ext4.
+    if log_block_size > 6 {
+        return false;
+    }
+    let block_size: u64 = 1024u64 << log_block_size;
+
+    let blocks_lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;
+    let fs_size = blocks_lo * block_size;
+
+    // Allow 1 block of slack — filesystem may not use the very last block.
+    // Note: only uses s_blocks_count_lo (sufficient for disks up to 16 TB at 4K blocks).
+    fs_size + block_size >= dev_size
 }
 
 /// Check /proc/mounts to see if anything is mounted at the given path.
@@ -855,8 +986,9 @@ fn mount_storage_disk() -> bool {
         return true;
     }
 
-    // --- Attempt 1: resize + mount (works on subsequent boots) ---
-    let resized = resize_ext4_if_needed(STORAGE_DEVICE, "storage");
+    // --- Attempt 1: resize (if needed) + mount (works on subsequent boots) ---
+    let resized =
+        ext4_already_full_size(STORAGE_DEVICE) || resize_ext4_if_needed(STORAGE_DEVICE, "storage");
     if resized && try_mount_storage_ext4() {
         info!("storage disk mounted after resize");
         create_storage_dirs(STORAGE_MOUNT);
@@ -1098,6 +1230,18 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
 /// Handle a single non-interactive request.
 fn handle_request(request: AgentRequest) -> AgentResponse {
+    // Ensure storage is mounted for operations that need it.
+    // Ping, NetworkTest, VmExec, and Shutdown don't access /storage.
+    match &request {
+        AgentRequest::Ping
+        | AgentRequest::NetworkTest { .. }
+        | AgentRequest::VmExec { .. }
+        | AgentRequest::Shutdown => {}
+        _ => {
+            ensure_storage_mounted();
+        }
+    }
+
     match request {
         AgentRequest::Ping => AgentResponse::Pong {
             version: PROTOCOL_VERSION,
@@ -1340,6 +1484,7 @@ fn handle_interactive_run(
     stream: &mut impl ReadWrite,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
     let (image, command, env, workdir, mounts, timeout_ms, tty, persistent_overlay_id) =
         match request {
             AgentRequest::Run {
@@ -2303,6 +2448,7 @@ fn handle_streaming_pull<S: Read + Write>(
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
     info!(
         image = %image,
         ?oci_platform,
@@ -2399,6 +2545,7 @@ fn handle_streaming_export_layer(
     image_digest: &str,
     layer_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_storage_mounted();
     info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer (chunked)");
 
     // Export layer to tar file
