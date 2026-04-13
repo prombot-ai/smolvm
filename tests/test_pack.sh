@@ -600,12 +600,11 @@ test_from_vm_setup() {
         return 1
     }
 
-    # Install curl so we can verify it persists into the packed binary
-    $SMOLVM machine exec --name "$FROM_VM_NAME" -- apk add --no-cache curl 2>&1 || {
-        $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-        $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
-        return 1
-    }
+    # Install curl so we can verify it persists into the packed binary.
+    # apk add may exit non-zero due to busybox trigger errors (busybox was
+    # baked into the rootfs, not installed from a repo, so re-extraction
+    # fails). The package itself installs fine — verify with `which curl`.
+    $SMOLVM machine exec --name "$FROM_VM_NAME" -- apk add --no-cache curl 2>&1 || true
 
     # Verify curl was installed
     local which_output
