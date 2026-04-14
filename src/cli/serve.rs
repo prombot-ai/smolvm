@@ -315,7 +315,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_listen_value, ListenTarget};
+    use super::ListenTarget;
 
     #[test]
     fn parse_tcp_listen_target() {
