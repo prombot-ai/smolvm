@@ -62,6 +62,20 @@ impl PortMapping {
         ports.iter().map(|p| p.to_tuple()).collect()
     }
 
+    /// Check for duplicate host ports in a list of mappings.
+    pub fn check_duplicates(ports: &[Self]) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for p in ports {
+            if !seen.insert(p.host) {
+                return Err(format!(
+                    "duplicate host port {}: each host port can only be mapped once",
+                    p.host
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Parse a port mapping specification (`HOST:GUEST` or `PORT`).
     pub fn parse(spec: &str) -> Result<Self, String> {
         if let Some((host, guest)) = spec.split_once(':') {

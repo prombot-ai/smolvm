@@ -293,6 +293,8 @@ impl RunCmd {
 
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
+        PortMapping::check_duplicates(&ports)
+            .map_err(|e| smolvm::Error::config("validate ports", e))?;
 
         if self.docker_config {
             if let Some(docker_mount) = docker_config_mount() {
@@ -304,6 +306,10 @@ impl RunCmd {
 
         // Require an explicit command, -it flag, or Smolfile entrypoint/cmd.
         // Without any of these, /bin/sh hangs waiting for input — confusing UX.
+        if self.detach && (self.interactive || self.tty) {
+            eprintln!("warning: -i/-t flags are ignored in detached mode (-d)");
+        }
+
         let has_smolfile_command = !params.entrypoint.is_empty() || !params.cmd.is_empty();
         let (interactive, tty) = if !self.interactive
             && !self.tty
@@ -953,6 +959,8 @@ impl CreateCmd {
         if self.ssh_agent {
             params.ssh_agent = true;
         }
+        PortMapping::check_duplicates(&params.port)
+            .map_err(|e| smolvm::Error::config("validate ports", e))?;
         vm_common::create_vm(params)
     }
 }
@@ -1126,7 +1134,19 @@ impl ResizeCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         let name_str = name.as_deref().unwrap_or("default");
 
-        vm_common::resize_vm(name_str, self.storage, self.overlay)
+        vm_common::resize_vm(name_str, self.storage, self.overlay).map_err(|e| {
+            if matches!(&e, smolvm::Error::InvalidState { .. }) {
+                smolvm::Error::agent(
+                    "resize",
+                    format!(
+                        "VM '{}' is running. Stop it first with: smolvm machine stop --name {}",
+                        name_str, name_str
+                    ),
+                )
+            } else {
+                e
+            }
+        })
     }
 }
 

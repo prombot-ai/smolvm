@@ -28,6 +28,10 @@ pub struct VmResources {
 /// Minimum memory required for the VM to boot (kernel + agent).
 const MIN_MEMORY_MIB: u32 = 64;
 
+/// Maximum vCPUs supported by the hypervisor (Hypervisor.framework on macOS).
+/// Requests above this are silently capped by libkrun.
+const MAX_EFFECTIVE_CPUS: u8 = 16;
+
 impl VmResources {
     /// Validate resource values before starting a VM. Returns an error with
     /// a clear message for values that would cause an opaque hypervisor failure.
@@ -37,6 +41,13 @@ impl VmResources {
                 "validate resources",
                 "CPU count must be at least 1",
             ));
+        }
+        if self.cpus > MAX_EFFECTIVE_CPUS {
+            eprintln!(
+                "warning: requested {} vCPUs but the hypervisor supports at most {}; \
+                 the VM will run with {} vCPUs",
+                self.cpus, MAX_EFFECTIVE_CPUS, MAX_EFFECTIVE_CPUS
+            );
         }
         if self.memory_mib < MIN_MEMORY_MIB {
             return Err(crate::Error::config(
