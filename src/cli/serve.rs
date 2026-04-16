@@ -1,7 +1,9 @@
 //! HTTP API server command.
 
+use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use smolvm::api::state::ApiState;
@@ -18,7 +20,7 @@ pub enum ServeCmd {
 Machines persist independently of the server - they continue running even if the server stops.
 
 API ENDPOINTS:
-  GET    /health                       Health check
+  GET    /health                      Health check
   POST   /api/v1/machines             Create machine
   GET    /api/v1/machines             List machines
   GET    /api/v1/machines/:id         Get machine status
@@ -28,9 +30,10 @@ API ENDPOINTS:
   DELETE /api/v1/machines/:id         Delete machine
 
 EXAMPLES:
-  smolvm serve start                         Listen on 127.0.0.1:8080 (default)
-  smolvm serve start -l 0.0.0.0:9000         Listen on all interfaces, port 9000
-  smolvm serve start -v                      Enable verbose logging")]
+  smolvm serve start                                Listen on the default Unix socket (unix:///$XDG_RUNTIME_DIR/smolvm.sock)
+  smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
+  smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
+  smolvm serve start -v                             Enable verbose logging")]
     Start(ServeStartCmd),
 
     /// Export OpenAPI specification for SDK generation
@@ -48,12 +51,12 @@ impl ServeCmd {
 
 #[derive(Parser, Debug)]
 pub struct ServeStartCmd {
-    /// Address and port to listen on
+    /// Address and port or Unix socket path to listen on
     #[arg(
         short,
         long,
-        default_value = "127.0.0.1:8080",
-        value_name = "ADDR:PORT"
+        default_value_t = default_listen_value(),
+        value_name = "ADDR:PORT|PATH"
     )]
     listen: String,
 
@@ -78,13 +81,7 @@ impl ServeStartCmd {
             std::env::set_var("SMOLVM_LOG_FORMAT", "json");
         }
 
-        // Parse listen address
-        let addr: SocketAddr = self.listen.parse().map_err(|e| {
-            smolvm::error::Error::config(
-                "parse listen address",
-                format!("invalid address '{}': {}", self.listen, e),
-            )
-        })?;
+        let listen_target = ListenTarget::parse(&self.listen)?;
 
         // Set up verbose logging if requested
         if self.verbose {
@@ -100,18 +97,19 @@ impl ServeStartCmd {
             .build()
             .map_err(smolvm::error::Error::Io)?;
 
-        runtime.block_on(async move { self.run_server(addr).await })
+        runtime.block_on(async move { self.run_server(listen_target).await })
     }
 
-    async fn run_server(self, addr: SocketAddr) -> Result<()> {
-        // Security warning if binding to all interfaces
-        if addr.ip().is_unspecified() {
-            eprintln!(
-                "WARNING: Server is listening on all interfaces ({}).",
-                addr.ip()
-            );
-            eprintln!("         The API has no authentication - any network client can control this host.");
-            eprintln!("         Consider using --listen 127.0.0.1:8080 for local-only access.");
+    async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+        if let ListenTarget::Tcp(addr) = &listen_target {
+            if addr.ip().is_unspecified() {
+                eprintln!(
+                    "WARNING: Server is listening on all interfaces ({}).",
+                    addr.ip()
+                );
+                eprintln!("         The API has no authentication - any network client can control this host.");
+                eprintln!("         Consider using the default Unix socket or --listen 127.0.0.1:8080 for local-only access.");
+            }
         }
 
         // Install Prometheus metrics recorder and mark start time
@@ -145,21 +143,14 @@ impl ServeStartCmd {
         });
 
         // Create router
-        let app = smolvm::api::create_router(state, self.cors_origins);
+        let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
-        // Create listener
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(smolvm::error::Error::Io)?;
-
-        tracing::info!(address = %addr, "starting HTTP API server");
-        println!("smolvm API server listening on http://{}", addr);
-
-        // Run the server with graceful shutdown (VMs keep running independently)
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(smolvm::error::Error::Io)?;
+        // Listen server on TCP or Unix socket
+        match listen_target {
+            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app).await?,
+            #[cfg(unix)]
+            ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
+        }
 
         // Signal supervisor to stop
         let _ = shutdown_tx.send(true);
@@ -171,6 +162,120 @@ impl ServeStartCmd {
         }
 
         Ok(())
+    }
+
+    async fn serve_tcp(&self, addr: SocketAddr, app: Router) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(smolvm::error::Error::Io)?;
+
+        tracing::info!(address = %addr, "starting HTTP API server");
+        println!("smolvm API server listening on http://{}", addr);
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(smolvm::error::Error::Io)
+    }
+
+    #[cfg(unix)]
+    async fn serve_unix(&self, path: PathBuf, app: Router) -> Result<()> {
+        let socket_guard = UnixSocketGuard::bind(&path)?;
+        let listener =
+            tokio::net::UnixListener::bind(&socket_guard.path).map_err(smolvm::error::Error::Io)?;
+
+        tracing::info!(path = %socket_guard.path.display(), "starting HTTP API server");
+        println!(
+            "smolvm API server listening on unix://{}",
+            socket_guard.path.display()
+        );
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(smolvm::error::Error::Io)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ListenTarget {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl ListenTarget {
+    fn parse(value: &str) -> Result<Self> {
+        if let Ok(addr) = value.parse::<SocketAddr>() {
+            return Ok(Self::Tcp(addr));
+        }
+
+        #[cfg(unix)]
+        {
+            let path = value.strip_prefix("unix://").unwrap_or(value);
+            Ok(Self::Unix(PathBuf::from(path)))
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(smolvm::error::Error::config(
+                "parse listen address",
+                format!("invalid address '{}': expected ADDR:PORT", value),
+            ))
+        }
+    }
+}
+
+fn default_listen_value() -> String {
+    #[cfg(unix)]
+    {
+        let path = dirs::runtime_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("smolvm.sock")
+            .display()
+            .to_string();
+        format!("unix://{path}")
+    }
+
+    #[cfg(not(unix))]
+    {
+        String::from("127.0.0.1:8080")
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct UnixSocketGuard {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl UnixSocketGuard {
+    fn bind(path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(smolvm::error::Error::Io)?;
+        }
+
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(smolvm::error::Error::Io(e)),
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %self.path.display(), error = %e, "failed to remove unix socket");
+            }
+        }
     }
 }
 
@@ -208,4 +313,44 @@ async fn shutdown_signal() {
 
     tracing::info!("shutdown signal received");
     eprintln!("\nShutting down server (VMs continue running)...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListenTarget;
+
+    #[test]
+    fn parse_tcp_listen_target() {
+        let target = ListenTarget::parse("127.0.0.1:8080").expect("tcp target should parse");
+        match target {
+            ListenTarget::Tcp(addr) => assert_eq!(addr.to_string(), "127.0.0.1:8080"),
+            #[cfg(unix)]
+            ListenTarget::Unix(path) => panic!("expected tcp, got unix path {}", path.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_listen_target() {
+        let target = ListenTarget::parse("/tmp/smol.sock").expect("unix target should parse");
+        match target {
+            ListenTarget::Unix(path) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/smol.sock"))
+            }
+            ListenTarget::Tcp(addr) => panic!("expected unix, got tcp address {addr}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_listen_target_with_prefix() {
+        let target =
+            ListenTarget::parse("unix:///tmp/smol.sock").expect("unix target should parse");
+        match target {
+            ListenTarget::Unix(path) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/smol.sock"))
+            }
+            ListenTarget::Tcp(addr) => panic!("expected unix, got tcp address {addr}"),
+        }
+    }
 }

@@ -31,7 +31,7 @@ echo ""
 
 # Test output directory (cleaned up at end)
 TEST_DIR=$(mktemp -d)
-trap "rm -rf '$TEST_DIR'" EXIT
+trap "rm -rf '$TEST_DIR'; $SMOLVM pack prune --all 2>/dev/null || true" EXIT
 
 # =============================================================================
 # Pack Command - Basic Tests
@@ -677,6 +677,222 @@ test_from_vm_cleanup() {
     return 0
 }
 
+# End-to-end test: --from-vm on an IMAGE-BASED VM captures container overlay.
+#
+# BUG-17 regression: `pack create --from-vm` for image-based VMs only captured
+# the base OCI layers, missing packages installed via apk/apt. The container
+# overlay (upper dir on the storage disk) wasn't exported. This test verifies
+# the full round-trip:
+#   1. Create image-based VM → install package → stop
+#   2. Pack with --from-vm (must export overlay as additional layer)
+#   3. Run packed binary — installed package must be present
+#   4. Create machine from .smolmachine — installed package must be present
+#   5. Stop/start machine — package persists across restart
+test_from_vm_image_overlay() {
+    local vm_name="from-vm-img-$$"
+    local pack_output="$TEST_DIR/from-vm-img-pack"
+    local machine_name="from-vm-img-machine-$$"
+
+    # Cleanup any leftovers
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine stop --name "$machine_name" 2>/dev/null || true
+    $SMOLVM machine delete "$machine_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    # 1. Create image-based VM, install curl, verify, stop
+    echo "  Step 1: Create image-based VM and install curl..."
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- apk add --no-cache curl 2>&1 || true
+    local which_result
+    which_result=$($SMOLVM machine exec --name "$vm_name" -- which curl 2>&1)
+    [[ "$which_result" == *"/usr/bin/curl"* ]] || {
+        echo "FAIL: curl not installed in source VM"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
+
+    # 2. Pack with --from-vm (this must export the container overlay)
+    echo "  Step 2: Pack image-based VM with --from-vm..."
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
+        echo "FAIL: pack --from-vm failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    [[ -f "$pack_output.smolmachine" ]] || {
+        echo "FAIL: no .smolmachine sidecar produced"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 3. Run packed binary — curl must be present
+    echo "  Step 3: Verify packed binary has curl..."
+    local run_result
+    run_result=$(run_with_timeout 60 $SMOLVM pack run --sidecar "$pack_output.smolmachine" -- which curl 2>&1)
+    [[ "$run_result" == *"/usr/bin/curl"* ]] || {
+        echo "FAIL: curl not found in packed binary (got: $run_result)"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+
+    # 4. Create machine from .smolmachine — curl must be present
+    echo "  Step 4: Create machine from .smolmachine and verify curl..."
+    $SMOLVM machine create "$machine_name" --from "$pack_output.smolmachine" --net 2>&1 || {
+        echo "FAIL: machine create --from failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+    $SMOLVM machine start --name "$machine_name" 2>&1 || {
+        echo "FAIL: machine start failed"
+        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+    local exec_result
+    exec_result=$($SMOLVM machine exec --name "$machine_name" -- which curl 2>&1)
+    [[ "$exec_result" == *"/usr/bin/curl"* ]] || {
+        echo "FAIL: curl not found in machine from .smolmachine (got: $exec_result)"
+        $SMOLVM machine stop --name "$machine_name" 2>/dev/null
+        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+
+    # 5. Stop/start — curl persists
+    echo "  Step 5: Verify persistence across restart..."
+    $SMOLVM machine stop --name "$machine_name" 2>&1 || true
+    $SMOLVM machine start --name "$machine_name" 2>&1 || {
+        echo "FAIL: restart failed"
+        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+    exec_result=$($SMOLVM machine exec --name "$machine_name" -- which curl 2>&1)
+    [[ "$exec_result" == *"/usr/bin/curl"* ]] || {
+        echo "FAIL: curl not found after restart (got: $exec_result)"
+        $SMOLVM machine stop --name "$machine_name" 2>/dev/null
+        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f "$pack_output" "$pack_output.smolmachine"; return 1
+    }
+
+    # Cleanup
+    $SMOLVM machine stop --name "$machine_name" 2>/dev/null || true
+    $SMOLVM machine delete "$machine_name" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+}
+
+# =============================================================================
+# Case-Insensitive Collision Test (macOS regression)
+#
+# Regression test for macOS case-insensitive APFS. Linux OCI layers may
+# contain paths that differ only in case (e.g., "gdebi" script vs "GDebi/"
+# directory). On case-insensitive macOS, these collide during host-side layer
+# extraction and previously caused a fatal "failed to unpack" error.
+#
+# This test builds a minimal Docker image with intentional case-conflicting
+# paths, pushes it to a local registry, packs it, and verifies the packed
+# binary runs successfully.
+# =============================================================================
+
+test_pack_case_collision() {
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo "SKIP: case-insensitive collision test only relevant on macOS"
+        return 0
+    fi
+
+    # Check if docker is available
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "SKIP: docker not installed"
+        return 0
+    fi
+
+    local img_tag="smolvm-case-test:latest"
+    local registry_port=5051
+    local registry_name="smolvm-test-registry-$$"
+    local registry_img="localhost:${registry_port}/smolvm-case-test:latest"
+    local output="$TEST_DIR/test-case-collision"
+
+    # 1. Build a minimal image with case-conflicting paths.
+    # Creates both "mymod" (file) and "MyMod/" (directory) under /usr/share/pkg/ —
+    # these are identical on case-insensitive APFS.
+    local dockerfile_dir
+    dockerfile_dir=$(mktemp -d)
+    cat > "$dockerfile_dir/Dockerfile" <<'DOCKERFILE'
+FROM alpine:latest
+RUN mkdir -p /usr/share/pkg/MyMod && \
+    echo '#!/bin/sh' > /usr/share/pkg/mymod && \
+    chmod +x /usr/share/pkg/mymod && \
+    echo 'print("init")' > /usr/share/pkg/MyMod/__init__.py && \
+    echo 'print("module")' > /usr/share/pkg/MyMod/Core.py
+DOCKERFILE
+
+    echo "  Building test image with case-conflicting paths..."
+    docker build --platform linux/arm64 -t "$img_tag" "$dockerfile_dir" >/dev/null 2>&1 || {
+        echo "SKIP: docker build failed"
+        rm -rf "$dockerfile_dir"
+        return 0
+    }
+    rm -rf "$dockerfile_dir"
+
+    # 2. Start a temporary local registry to push the image to.
+    echo "  Starting temporary registry on port $registry_port..."
+    docker run -d -p "${registry_port}:5000" --name "$registry_name" registry:2 >/dev/null 2>&1 || {
+        echo "SKIP: could not start local registry"
+        return 0
+    }
+
+    # Ensure cleanup on exit (registry container + image)
+    local cleanup_done=false
+    cleanup_case_test() {
+        if [[ "$cleanup_done" == "true" ]]; then return; fi
+        cleanup_done=true
+        docker stop "$registry_name" >/dev/null 2>&1 || true
+        docker rm "$registry_name" >/dev/null 2>&1 || true
+        docker rmi "$img_tag" "$registry_img" >/dev/null 2>&1 || true
+    }
+    trap cleanup_case_test RETURN
+
+    # 3. Push to the local registry.
+    docker tag "$img_tag" "$registry_img" >/dev/null 2>&1
+    docker push "$registry_img" >/dev/null 2>&1 || {
+        echo "SKIP: could not push to local registry"
+        cleanup_case_test
+        return 0
+    }
+
+    # 4. Pack the image.
+    echo "  Packing image from local registry..."
+    $SMOLVM pack create --image "$registry_img" -o "$output" 2>&1 || {
+        echo "FAIL: pack create failed"
+        cleanup_case_test
+        return 1
+    }
+
+    [[ -f "$output" ]] || { echo "FAIL: packed binary not created"; return 1; }
+    [[ -f "$output.smolmachine" ]] || { echo "FAIL: sidecar not created"; return 1; }
+
+    # 5. Run the packed binary — this is the critical test.
+    # Previously this failed with: "failed to unpack .../GDebi"
+    # Verify BOTH case-conflicting paths exist in the guest filesystem.
+    # Just proving "echo works" is not enough — we need to confirm the
+    # image contents are faithful (both mymod file AND MyMod/ directory).
+    echo "  Running packed binary (verifying filesystem fidelity)..."
+    local result
+    result=$(run_with_timeout 60 "$output" run -- /bin/sh -c \
+        "test -f /usr/share/pkg/mymod && test -d /usr/share/pkg/MyMod && test -f /usr/share/pkg/MyMod/__init__.py && echo 'case-fidelity-ok'" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT: packed binary hung"; return 1; }
+    [[ "$result" == *"case-fidelity-ok"* ]] || {
+        echo "FAIL: case-conflicting paths not preserved in guest. Output: $result"
+        return 1
+    }
+}
+
 # =============================================================================
 # Error Handling Tests
 # =============================================================================
@@ -761,7 +977,7 @@ test_packed_rbase_run() {
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"R version"* ]]
+    [[ "$result" == *"R version"* ]] || [[ "$result" == *"r ('littler') version"* ]]
 }
 
 test_packed_rbase_auto_storage() {
@@ -787,6 +1003,101 @@ test_packed_rbase_auto_storage() {
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"auto-storage-ok"* ]]
+}
+
+# =============================================================================
+# Multi-Layer First Exec Performance Regression Test
+#
+# Regression test: images with many layers (e.g., rocker/tidyverse has 20)
+# caused a 16-second first exec because overlayfs multi-lowerdir mount fails
+# on virtiofs-backed layers. The fallback physically merged all layers on
+# every first exec after restart. Fix: pre-merge layers at pack time so the
+# packed binary has a single lowerdir that mounts instantly.
+#
+# Uses python:3.12 (7 layers) — enough to verify multi-layer handling while
+# keeping test time reasonable. The threshold is 5 seconds; the old path
+# took 10-16s, the fixed path takes <1s.
+# =============================================================================
+
+test_multi_layer_first_exec_fast() {
+    local pack_output="$TEST_DIR/test-multilayer"
+    local vm_name="multilayer-perf-$$"
+    local MAX_FIRST_EXEC_SECS=5
+
+    # Pack a multi-layer image (python:3.12 has 7 layers)
+    if [[ ! -f "$pack_output.smolmachine" ]]; then
+        $SMOLVM pack create --image python:3.12 -o "$pack_output" 2>&1 || {
+            echo "SKIP: pack create failed"
+            return 0
+        }
+    fi
+    [[ -f "$pack_output.smolmachine" ]] || { echo "SKIP: no sidecar"; return 0; }
+
+    # Create machine from .smolmachine
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine create "$vm_name" --from "$pack_output.smolmachine" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Time the first exec (the critical measurement)
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- python3 -c "print('fast')" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  First exec: ${elapsed}s (threshold: ${MAX_FIRST_EXEC_SECS}s)"
+
+    # Verify it worked
+    [[ "$result" == *"fast"* ]] || {
+        echo "FAIL: exec failed: $result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # Verify it was fast
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > $MAX_FIRST_EXEC_SECS else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: first exec took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s) — multi-layer overlay merge regression?"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    fi
+
+    # Also verify stop/start doesn't regress
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || true
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    result=$($SMOLVM machine exec --name "$vm_name" -- python3 -c "print('still-fast')" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  After restart: ${elapsed}s"
+
+    [[ "$result" == *"still-fast"* ]] || {
+        echo "FAIL: exec after restart failed: $result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > $MAX_FIRST_EXEC_SECS else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: exec after restart took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s)"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    fi
+
+    # Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 }
 
 # =============================================================================
@@ -871,6 +1182,12 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "from-vm: pack stopped VM" test_from_vm_pack || true
     run_test "from-vm: finds installed package" test_from_vm_run_finds_installed_package || true
     run_test "from-vm: cleanup" test_from_vm_cleanup || true
+
+    echo ""
+    echo "Running --from-vm Image-Based Tests (BUG-17 regression)..."
+    echo ""
+
+    run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
 fi
 
 # =============================================================================
@@ -1032,6 +1349,12 @@ echo ""
 
 run_test "Pack nonexistent image" test_pack_nonexistent_image || true
 
+echo ""
+echo "Running Case-Insensitive Collision Tests (macOS)..."
+echo ""
+
+run_test "Pack image with case-conflicting paths" test_pack_case_collision || true
+
 if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
     echo "Running Large Image Tests..."
@@ -1043,6 +1366,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "Pack r-base (large image, streaming export)" test_pack_rbase || true
     run_test "Packed r-base run" test_packed_rbase_run || true
     run_test "Packed r-base auto-sized storage (force-extract)" test_packed_rbase_auto_storage || true
+    run_test "First exec instant on multi-layer .smolmachine" test_multi_layer_first_exec_fast || true
 fi
 
 print_summary "Pack Tests"

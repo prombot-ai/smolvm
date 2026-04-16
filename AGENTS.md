@@ -33,6 +33,11 @@ smolvm machine create myvm --ssh-agent --net
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
+
+# Create machine from packed artifact (fast start, no pull)
+smolvm machine create my-vm --from ./my-python.smolmachine
+smolvm machine start --name my-vm
+smolvm machine exec --name my-vm -- pip install requests
 ```
 
 ## When to Use What
@@ -43,6 +48,7 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 | Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
+| Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
@@ -52,7 +58,9 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 - **`machine run`** — ephemeral. All changes are discarded when the command exits.
 - **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
 - **`machine stop` + `start`** — changes persist across restarts. The persistent overlay is remounted preserving previous changes.
-- **`pack run`** / **`pack exec`** — ephemeral. Each exec starts fresh from the packed image.
+- **`pack run`** — ephemeral. Each run starts fresh from the packed image.
+- **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
+- **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
 
 ## CLI Structure
 
@@ -62,6 +70,7 @@ All commands use named flags (no positional args except `machine create NAME` an
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
 smolvm machine create NAME [OPTIONS]              # create persistent
+smolvm machine create NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
 smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
@@ -75,7 +84,7 @@ smolvm pack create --image IMAGE -o PATH          # package
 smolvm pack create --from-vm NAME -o PATH         # pack from VM snapshot
 smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 
-smolvm serve start [--listen ADDR:PORT]           # HTTP API
+smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
 ```
 
@@ -232,9 +241,10 @@ through the container's overlay filesystem so both commands see the
 same files.
 
 **`/workspace` shared directory:** Every machine has a `/workspace`
-directory that is shared between the VM and the container. It persists
-across `exec` sessions and is a good default location for scripts,
-data, and results:
+directory — bare VMs, image-based VMs, and machines created from
+`.smolmachine` artifacts. It persists across `exec` sessions and
+across `stop`/`start` cycles. It's a good default location for
+scripts, data, and results:
 
 ```bash
 # Typical agent workflow: copy code in, execute, extract results
@@ -321,6 +331,15 @@ The packed binary runs as a normal executable:
 ./my-app stop                                # stop daemon
 ```
 
+Alternatively, create a named machine from the `.smolmachine` for full lifecycle management:
+```bash
+smolvm machine create my-vm --from my-app.smolmachine
+smolvm machine start --name my-vm            # ~250ms boot, no image pull
+smolvm machine exec --name my-vm -- pip install x   # fully persistent
+smolvm machine stop --name my-vm
+smolvm machine ls                            # shows my-vm
+```
+
 The `.smolmachine` manifest includes registry-oriented metadata:
 - `host_platform` — host OS+arch this machine runs on (e.g., `darwin/arm64`), distinct from `platform` which is the guest
 - `created` — RFC 3339 timestamp of when the machine was packed
@@ -328,7 +347,7 @@ The `.smolmachine` manifest includes registry-oriented metadata:
 
 ## HTTP API
 
-Start with `smolvm serve start --listen 127.0.0.1:8080`. Key endpoints:
+Start with `smolvm serve start --listen 127.0.0.1:8080` or `smolvm serve start --listen $XDG_RUNTIME_DIR/smolvm.sock`. Key endpoints:
 
 ```
 POST   /api/v1/machines                    Create machine

@@ -156,6 +156,13 @@ pub struct LaunchFeatures {
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Pre-extracted OCI layer directory for machines created from .smolmachine.
+    /// When set, the launcher mounts this directory via virtiofs so the agent
+    /// can use pre-extracted layers instead of pulling from a registry.
+    pub packed_layers_dir: Option<std::path::PathBuf>,
+    /// Additional disk images to attach to the VM (path, read_only).
+    /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
+    pub extra_disks: Vec<(std::path::PathBuf, bool)>,
 }
 
 /// Configuration for launching an agent VM.
@@ -179,6 +186,11 @@ pub struct LaunchConfig<'a> {
     /// Host DNS filter socket path. When set, the guest DNS proxy forwards
     /// queries over vsock to this socket for filtering.
     pub dns_filter_socket: Option<&'a Path>,
+    /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
+    /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
+    pub packed_layers_dir: Option<&'a Path>,
+    /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
+    pub extra_disks: &'a [(std::path::PathBuf, bool)],
 }
 
 /// Launch the agent VM using libkrun.
@@ -195,7 +207,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         resources,
         ssh_agent_socket,
         dns_filter_socket,
+        packed_layers_dir,
+        extra_disks,
     } = config;
+
+    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+
     // Raise file descriptor limits
     raise_fd_limits();
 
@@ -396,6 +413,30 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Add extra disks (e.g., source VM storage for --from-vm export)
+        // These appear as /dev/vdc, /dev/vdd, ... after storage and overlay
+        for (i, (disk_path, read_only)) in extra_disks.iter().enumerate() {
+            let block_id_str = format!("extra{}", i);
+            let block_id = try_or_free_ctx!(
+                CString::new(block_id_str.as_str()),
+                "add extra disk",
+                "block id contains null byte"
+            );
+            let path = try_or_free_ctx!(
+                path_to_cstring(disk_path),
+                "add extra disk",
+                "path contains null byte"
+            );
+            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, *read_only) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add extra disk",
+                    format!("krun_add_disk2 failed for extra disk {}", i),
+                ));
+            }
+            tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
+        }
+
         // Add vsock port for control channel (critical - host-guest communication)
         let socket_path = try_or_free_ctx!(
             path_to_cstring(vsock_socket),
@@ -491,6 +532,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Mount pre-extracted OCI layers for .smolmachine-sourced machines.
+        // The agent detects this via SMOLVM_PACKED_LAYERS and uses the layers
+        // as container overlay lowerdirs instead of pulling from a registry.
+        if let Some(layers_dir) = packed_layers_dir {
+            if layers_dir.exists() {
+                let tag = cstr("smolvm_layers");
+                let host_path = path_to_cstring(layers_dir)?;
+                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add packed layers virtiofs",
+                        "krun_add_virtiofs failed for packed layers",
+                    ));
+                }
+            }
+        }
+
         // Set working directory
         let workdir = cstr("/");
         krun_set_workdir(ctx, workdir.as_ptr());
@@ -534,6 +592,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start DNS filtering proxy
         if dns_filter_socket.is_some() {
             env_strings.push(cstr("SMOLVM_DNS_FILTER=1"));
+        }
+
+        // Tell the agent about pre-extracted packed layers
+        if packed_layers_dir.is_some_and(|d| d.exists()) {
+            env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

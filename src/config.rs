@@ -11,6 +11,7 @@ use crate::data::network::DEFAULT_DNS;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
+use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -395,6 +396,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
 
+    /// Preferred network backend override for machine launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_backend: Option<NetworkBackend>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -439,6 +444,12 @@ pub struct VmRecord {
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
+
+    /// Absolute path to the .smolmachine sidecar this machine was created from.
+    /// When set, `machine start` extracts layers from the sidecar and mounts
+    /// them via virtiofs instead of pulling the image from a registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_smolmachine: Option<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -478,6 +489,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            network_backend: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -489,6 +501,7 @@ impl VmRecord {
             ssh_agent: false,
             dns_filter_hosts: None,
             ephemeral: false,
+            source_smolmachine: None,
         }
     }
 
@@ -521,6 +534,7 @@ impl VmRecord {
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
+            network_backend: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -532,6 +546,7 @@ impl VmRecord {
             ssh_agent: false,
             dns_filter_hosts: None,
             ephemeral: false,
+            source_smolmachine: None,
         }
     }
 
@@ -586,6 +601,7 @@ impl VmRecord {
             cpus: self.cpus,
             memory_mib: self.mem,
             network: self.network,
+            network_backend: self.network_backend,
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),

@@ -7,8 +7,12 @@ use smolvm::data::storage::HostMount;
 use std::time::Duration;
 
 /// Parse a duration string (e.g., "30s", "5m", "1h").
-pub fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
+    if d.is_zero() {
+        return Err("timeout must be greater than 0 (e.g., 5sec, 30s)".to_string());
+    }
+    Ok(d)
 }
 
 // Env parsing delegated to the library.

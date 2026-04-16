@@ -107,6 +107,149 @@ test_machine_exec_exit_code() {
     [[ $exit_code -eq 1 ]]
 }
 
+# Regression test: a failed exec (nonexistent binary, empty command, bad
+# workdir) must NOT kill the VM. Previously, the error propagated through
+# ExecCmd::run(), the AgentManager was not detached, and Drop called
+# stop() which terminated the VM process.
+test_machine_exec_failed_does_not_kill_vm() {
+    ensure_machine_running
+
+    # Nonexistent binary — should fail but VM stays alive
+    local exit_code=0
+    $SMOLVM machine exec -- /nonexistent_binary_xyz 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected failure for nonexistent binary"; return 1; }
+
+    # VM must still be running
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM died after failed exec: $status"; return 1; }
+
+    # Next exec must succeed
+    local output
+    output=$($SMOLVM machine exec -- echo "survived-failed-exec" 2>&1)
+    [[ "$output" == *"survived-failed-exec"* ]] || { echo "exec after failure returned: $output"; return 1; }
+
+    # Empty string command — should fail but VM stays alive
+    exit_code=0
+    $SMOLVM machine exec -- "" 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected failure for empty command"; return 1; }
+
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM died after empty command exec: $status"; return 1; }
+
+    # Final verification
+    output=$($SMOLVM machine exec -- echo "still-alive" 2>&1)
+    [[ "$output" == *"still-alive"* ]]
+}
+
+# Regression test for BUG-12: SIGTERM on the exec client used to leave the
+# agent stuck waiting for the orphan child (e.g., `sleep 30`) to finish,
+# blocking the accept loop. The VM would show "unreachable" and the next
+# exec would wait ~30s for the orphan to exit or trigger a recovery kill.
+#
+# Fix: agent detects client disconnect via recv(MSG_PEEK|MSG_DONTWAIT), kills
+# the child's process group (killpg) to also kill descendants like `sleep`,
+# and closes the connection without looping back to read_exact.
+test_sigterm_during_exec_does_not_stall_vm() {
+    local name="bug12-sigterm-$$"
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
+        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Start a long-running exec, then SIGTERM the client mid-flight.
+    $SMOLVM machine exec --name "$name" -- sh -c 'sleep 30' &
+    local client_pid=$!
+    sleep 3
+    kill -TERM "$client_pid" 2>/dev/null
+    wait "$client_pid" 2>/dev/null
+    # Give the agent's 10ms poll loop a moment to detect the disconnect
+    sleep 1
+
+    # VM must still be reachable. Before the fix, state would be "unreachable"
+    # and the next exec would take ~30s. Time the exec to detect the stall.
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    local result
+    result=$($SMOLVM machine exec --name "$name" -- echo "survived" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  Next exec after SIGTERM: ${elapsed}s"
+
+    [[ "$result" == *"survived"* ]] || {
+        echo "FAIL: exec after SIGTERM failed: $result"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    # Must be fast — the old path took ~30s while the orphan sleep finished.
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > 5 else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled on orphan child?"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
+# Regression test for BUG-20: `exec --timeout` used to kill not just the
+# child but leave the agent in an unreachable state. Same root cause as
+# BUG-12 — orphan child processes held the stdout pipe. Now killpg hits
+# the whole process group on timeout.
+test_exec_timeout_does_not_stall_vm() {
+    local name="bug20-timeout-$$"
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
+        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Short timeout, long-running command with sub-processes — timeout should
+    # kill the whole tree without stalling the agent.
+    local result
+    result=$($SMOLVM machine exec --name "$name" --timeout 2s -- sh -c 'sleep 30' 2>&1)
+    # Exit code 124 = timeout, expected behavior (don't assert — just note)
+
+    # Next exec must be fast. If the agent stalled, this will take ~30s.
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    result=$($SMOLVM machine exec --name "$name" -- echo "alive" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  Next exec after timeout: ${elapsed}s"
+
+    [[ "$result" == *"alive"* ]] || {
+        echo "FAIL: exec after timeout failed: $result"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > 5 else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled after timeout?"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
 # =============================================================================
 # Named VMs
 # =============================================================================
@@ -928,6 +1071,19 @@ test_machine_run_timeout() {
     [[ "$output" == *"timed out"* ]] || [[ "$output" == *"Killed"* ]] || [[ $? -ne 0 ]]
 }
 
+# Regression: /workspace must exist on bare VMs (not just image-based).
+test_bare_vm_workspace() {
+    ensure_machine_running
+    local output
+    output=$($SMOLVM machine exec -- ls -d /workspace 2>&1)
+    [[ "$output" == *"/workspace"* ]] || { echo "FAIL: /workspace missing on bare VM"; return 1; }
+
+    # Write and read back
+    $SMOLVM machine exec -- sh -c 'echo ws-bare > /workspace/bare.txt' 2>&1 || return 1
+    output=$($SMOLVM machine exec -- cat /workspace/bare.txt 2>&1)
+    [[ "$output" == *"ws-bare"* ]]
+}
+
 test_machine_run_pipeline() {
     local output
     output=$($SMOLVM machine run --net --image alpine:latest -- sh -c "echo 'hello world' | wc -w" 2>&1)
@@ -981,6 +1137,9 @@ run_test "Machine status (running)" test_machine_status_running || true
 run_test "Machine start/stop cycle" test_machine_start_stop_cycle || true
 run_test "Machine exec" test_machine_exec || true
 run_test "Machine exec exit code" test_machine_exec_exit_code || true
+run_test "Failed exec does not kill VM" test_machine_exec_failed_does_not_kill_vm || true
+run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_not_stall_vm || true
+run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm || true
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
@@ -1007,6 +1166,72 @@ run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_ex
 run_test "Port: mapping host to guest HTTP" test_machine_port_mapping_http || true
 run_test "Overlay: custom size via --overlay" test_machine_overlay_size || true
 
+# Regression: two VMs with the same host port should conflict on start.
+test_port_conflict_across_vms() {
+    local vm_a="port-conflict-a-$$"
+    local vm_b="port-conflict-b-$$"
+
+    $SMOLVM machine create "$vm_a" -p 19876:80 --net 2>&1 >/dev/null || return 1
+    $SMOLVM machine create "$vm_b" -p 19876:80 --net 2>&1 >/dev/null || return 1
+
+    $SMOLVM machine start --name "$vm_a" 2>&1 >/dev/null || {
+        $SMOLVM machine delete "$vm_a" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_b" -f 2>/dev/null
+        return 1
+    }
+
+    # Second start should fail with port conflict
+    local exit_code=0
+    local output
+    output=$($SMOLVM machine start --name "$vm_b" 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected port conflict error"; }
+    [[ "$output" == *"already in use"* ]] || { echo "expected 'already in use' message"; }
+
+    $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_a" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_b" -f 2>/dev/null || true
+
+    [[ $exit_code -ne 0 ]]
+}
+
+run_test "Port: cross-VM conflict detected" test_port_conflict_across_vms || true
+
+# Regression: concurrent machine starts used to fail with "Database already
+# open. Cannot acquire lock." The fix retries with exponential backoff.
+test_concurrent_machine_start() {
+    local vm_a="conc-start-a-$$"
+    local vm_b="conc-start-b-$$"
+
+    $SMOLVM machine create "$vm_a" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+    $SMOLVM machine create "$vm_b" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+
+    # Start both simultaneously — previously the second would fail with DB lock error
+    $SMOLVM machine start --name "$vm_a" 2>&1 >/dev/null &
+    local pid_a=$!
+    $SMOLVM machine start --name "$vm_b" 2>&1 >/dev/null &
+    local pid_b=$!
+    wait $pid_a; local exit_a=$?
+    wait $pid_b; local exit_b=$?
+
+    # Both should succeed
+    [[ $exit_a -eq 0 ]] || { echo "FAIL: start a failed (exit $exit_a)"; }
+    [[ $exit_b -eq 0 ]] || { echo "FAIL: start b failed (exit $exit_b)"; }
+
+    # Both should be running
+    local status_a status_b
+    status_a=$($SMOLVM machine status --name "$vm_a" 2>&1)
+    status_b=$($SMOLVM machine status --name "$vm_b" 2>&1)
+
+    $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_b" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_a" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_b" -f 2>/dev/null || true
+
+    [[ "$status_a" == *"running"* ]] && [[ "$status_b" == *"running"* ]]
+}
+
+run_test "Concurrent machine starts" test_concurrent_machine_start || true
+
 echo ""
 echo "--- Machine Run (Ephemeral) Tests ---"
 echo ""
@@ -1019,8 +1244,51 @@ run_test "Machine run: volume readonly" test_machine_run_volume_readonly || true
 run_test "Machine run: workdir" test_machine_run_workdir || true
 run_test "Machine run: detached" test_machine_run_detached || true
 run_test "Machine run: timeout" test_machine_run_timeout || true
+run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "Machine images" test_machine_images || true
 run_test "Machine prune --dry-run" test_machine_prune_dry_run || true
+
+# =============================================================================
+# Resource Validation
+# =============================================================================
+
+test_resource_cpus_zero_rejected() {
+    local exit_code=0
+    $SMOLVM machine run --cpus 0 -- echo hello 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+}
+
+test_resource_mem_zero_rejected() {
+    local exit_code=0
+    $SMOLVM machine run --mem 0 -- echo hello 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+}
+
+test_resource_mem_below_minimum_rejected() {
+    local exit_code=0
+    local output
+    output=$($SMOLVM machine run --mem 1 -- echo hello 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || return 1
+    [[ "$output" == *"at least"* ]] || return 1
+}
+
+# Regression: `machine start --name X` where X doesn't exist used to silently
+# create and start a "default" VM. Now it correctly returns an error.
+test_start_nonexistent_name_rejected() {
+    local exit_code=0
+    $SMOLVM machine start --name nonexistent-vm-regression-test 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected error for nonexistent VM"; return 1; }
+
+    # Verify no "default" VM was created
+    local list
+    list=$($SMOLVM machine ls --json 2>&1)
+    [[ "$list" != *"nonexistent-vm-regression-test"* ]] || { echo "VM should not exist"; return 1; }
+}
+
+run_test "Resource: --cpus 0 rejected" test_resource_cpus_zero_rejected || true
+run_test "Resource: --mem 0 rejected" test_resource_mem_zero_rejected || true
+run_test "Resource: --mem below minimum rejected" test_resource_mem_below_minimum_rejected || true
+run_test "Start --name nonexistent rejected" test_start_nonexistent_name_rejected || true
 
 # =============================================================================
 # Auto-Generated Names
@@ -1069,6 +1337,79 @@ echo "--- Auto-Generated Names ---"
 echo ""
 
 run_test "Auto-generated names" test_auto_generated_names || true
+
+# =============================================================================
+# Create from .smolmachine
+# =============================================================================
+
+test_create_from_smolmachine() {
+    local vm_name="from-smolmachine-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/from-sm-pack"
+
+    # 1. Pack alpine into a .smolmachine
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 || {
+        echo "SKIP: pack create failed"
+        return 0
+    }
+    [[ -f "$pack_output.smolmachine" ]] || { echo "FAIL: no sidecar"; return 1; }
+
+    # 2. Create a named machine from it
+    $SMOLVM machine create "$vm_name" --from "$pack_output.smolmachine" 2>&1 || return 1
+
+    # 3. Start the machine (should NOT pull — uses extracted layers)
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        echo "FAIL: start failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+
+    # 4. Exec works
+    local exec_result
+    exec_result=$($SMOLVM machine exec --name "$vm_name" -- echo "from-sm-ok" 2>&1)
+    [[ "$exec_result" == *"from-sm-ok"* ]] || {
+        echo "FAIL: exec failed: $exec_result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+
+    # 5. Persistence: write then read
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo persist > /tmp/sm.txt' 2>&1 || true
+    local read_result
+    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/sm.txt 2>&1)
+    [[ "$read_result" == *"persist"* ]] || {
+        echo "FAIL: persistence failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+
+    # 6. Stop and restart — persistence survives
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || true
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        echo "FAIL: restart failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/sm.txt 2>&1)
+    [[ "$read_result" == *"persist"* ]] || {
+        echo "FAIL: persistence across restart failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+
+    # 7. Shows in ls
+    $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || {
+        echo "FAIL: not in ls"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+    }
+
+    # 8. Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+}
+
+run_test "Create from .smolmachine" test_create_from_smolmachine || true
 
 # =============================================================================
 # Ephemeral VM Tracking
@@ -1548,6 +1889,61 @@ test_prune_dry_run_refuses_on_running_vm() {
     [[ "$output" == *"cannot prune while the machine is running"* ]]
 }
 
+test_machine_ls_does_not_kill_vm() {
+    # Regression test: state_probe's probe_agent() used to create a temporary
+    # AgentManager without detaching it. When that manager was dropped, its
+    # Drop impl sent a Shutdown command to the agent, killing the VM.
+    # Every `machine ls` (and any state-checking command) triggered this.
+    # The old bug killed VMs within 10-20 seconds; we verify survival for 60s.
+    ensure_machine_running
+
+    # Repeatedly call `machine ls` — each call probes the agent via
+    # resolve_state → probe_agent. Before the fix, the first call
+    # would kill the VM.
+    for i in 1 2 3 4 5 6; do
+        local output
+        output=$($SMOLVM machine ls 2>&1)
+        [[ "$output" == *"running"* ]] || { echo "VM died after ls call #$i: $output"; return 1; }
+        sleep 10
+    done
+
+    # Exec must still work after 6 ls calls over 60 seconds
+    local result
+    result=$($SMOLVM machine exec -- echo "survived-ls-probe" 2>&1)
+    [[ "$result" == *"survived-ls-probe"* ]] || { echo "exec failed after ls probes: $result"; return 1; }
+}
+
+test_named_vm_survives_ls() {
+    # Same regression test but with a named VM — the customer's exact scenario:
+    # machine create X --from .smolmachine → machine start → machine ls shows stopped.
+    # Verify over 60 seconds with interleaved ls + exec.
+    local name="ls-probe-test"
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 || return 1
+    $SMOLVM machine start --name "$name" 2>&1 || return 1
+
+    # Wait for agent to be fully ready
+    sleep 2
+
+    for i in 1 2 3 4 5 6; do
+        local state
+        state=$($SMOLVM machine ls 2>&1 | grep "$name" | awk '{print $2}')
+        [[ "$state" == "running" ]] || { echo "VM '$name' died after ls #$i (state: $state)"; $SMOLVM machine delete "$name" -f 2>/dev/null; return 1; }
+        sleep 10
+    done
+
+    # Exec must work after 60 seconds of ls probing
+    local result
+    result=$($SMOLVM machine exec --name "$name" -- echo "alive" 2>&1)
+    [[ "$result" == *"alive"* ]] || { echo "exec failed: $result"; $SMOLVM machine delete "$name" -f 2>/dev/null; return 1; }
+
+    $SMOLVM machine stop --name "$name" 2>&1 || true
+    $SMOLVM machine delete "$name" -f 2>&1 || true
+}
+
+run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
+run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true
 run_test "Prune: refuses on running VM" test_prune_refuses_on_running_vm || true
 run_test "Prune --dry-run: refuses on running VM" test_prune_dry_run_refuses_on_running_vm || true

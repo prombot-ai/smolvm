@@ -62,6 +62,7 @@ fn boot_log(level: &str, msg: &str) {
     eprintln!("{}", format_boot_log(level, msg));
 }
 mod dns_proxy;
+mod network;
 mod oci;
 mod paths;
 mod process;
@@ -164,9 +165,36 @@ fn main() {
         "smolvm-agent started, vsock listener already ready"
     );
 
+    let t0 = uptime_ms();
+    match network::configure_from_env() {
+        Ok(true) => {
+            info!(
+                duration_ms = uptime_ms() - t0,
+                "guest virtio network configured"
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            error!(error = %err, "failed to configure guest network");
+            std::process::exit(1);
+        }
+    }
+
     // Mount storage disk eagerly during deferred init. If a request arrives
     // before this point, ensure_storage_mounted() handles the mount on demand.
     ensure_storage_mounted();
+
+    // Create /workspace symlink for bare VMs. Image-based VMs get /workspace
+    // via a bind mount in the container spec, but bare VMs run directly in the
+    // VM rootfs where /workspace doesn't exist. The symlink makes /workspace
+    // available in both modes.
+    {
+        let workspace_link = std::path::Path::new("/workspace");
+        let workspace_target = std::path::Path::new("/storage/workspace");
+        if !workspace_link.exists() && workspace_target.exists() {
+            let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
+        }
+    }
 
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
@@ -1263,9 +1291,25 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             write_session = None;
         }
 
-        // Handle regular request
-        let response = handle_request(request);
-        send_response(stream, &response)?;
+        // Handle regular request. Pass the stream's fd so long-running
+        // commands (exec, run) can detect client disconnect and kill their
+        // children instead of blocking the accept loop.
+        let client_fd = stream.as_raw_fd();
+        let response = handle_request(request, Some(client_fd));
+
+        // Check for client disconnection BEFORE writing — if the peer is gone,
+        // write_all may succeed (kernel buffers) but the next read_exact would
+        // block forever waiting for bytes that will never arrive. Close the
+        // connection now and let the accept loop pick up the next client.
+        if process::is_peer_closed(client_fd) {
+            debug!("client disconnected during request, closing connection");
+            return Ok(());
+        }
+
+        if let Err(e) = send_response(stream, &response) {
+            debug!(error = %e, "send_response failed (client disconnected?)");
+            return Ok(());
+        }
 
         // Check for shutdown
         if matches!(response, AgentResponse::Ok { .. }) {
@@ -1280,7 +1324,15 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 }
 
 /// Handle a single non-interactive request.
-fn handle_request(request: AgentRequest) -> AgentResponse {
+///
+/// `client_fd` is the vsock file descriptor of the requesting client. It's
+/// used by long-running handlers (Run, VmExec) to detect when the client
+/// disconnects so the child process can be killed promptly — freeing the
+/// accept loop for the next request instead of waiting for the orphan.
+fn handle_request(
+    request: AgentRequest,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> AgentResponse {
     // Ensure storage is mounted for operations that need it.
     // Ping, NetworkTest, VmExec, and Shutdown don't access /storage.
     match &request {
@@ -1405,7 +1457,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             interactive: false,
             tty: false,
             ..
-        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms),
+        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms, client_fd),
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
@@ -1433,6 +1485,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             &mounts,
             timeout_ms,
             persistent_overlay_id.as_deref(),
+            client_fd,
         ),
 
         AgentRequest::Run { .. } => {
@@ -2353,6 +2406,16 @@ fn spawn_interactive_command(
 }
 
 /// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
+/// Kill a child process and return a timeout exit code. Used when the host
+/// disconnects during an interactive exec — the agent must clean up the
+/// child and continue accepting new connections rather than propagating
+/// the I/O error.
+fn kill_child_on_disconnect(child: &mut Child) -> i32 {
+    let _ = child.kill();
+    let _ = child.wait();
+    124
+}
+
 fn run_interactive_loop(
     stream: &mut impl ReadWrite,
     child: &mut Child,
@@ -2459,19 +2522,25 @@ fn run_interactive_loop(
             continue;
         }
 
-        // Read available stdout
+        // Read available stdout. If send_response fails (host disconnected),
+        // kill the child and return gracefully.
         if poll_fds[0].revents & libc::POLLIN != 0 {
             if let Some(ref mut stdout) = child_stdout {
                 loop {
                     match stdout.read(&mut stdout_buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            send_response(
+                            if send_response(
                                 stream,
                                 &AgentResponse::Stdout {
                                     data: stdout_buf[..n].to_vec(),
                                 },
-                            )?;
+                            )
+                            .is_err()
+                            {
+                                debug!("host disconnected while sending stdout");
+                                return Ok(kill_child_on_disconnect(child));
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
@@ -2483,19 +2552,24 @@ fn run_interactive_loop(
             }
         }
 
-        // Read available stderr
+        // Read available stderr. Same disconnection handling as stdout.
         if poll_fds[1].revents & libc::POLLIN != 0 {
             if let Some(ref mut stderr) = child_stderr {
                 loop {
                     match stderr.read(&mut stderr_buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            send_response(
+                            if send_response(
                                 stream,
                                 &AgentResponse::Stderr {
                                     data: stderr_buf[..n].to_vec(),
                                 },
-                            )?;
+                            )
+                            .is_err()
+                            {
+                                debug!("host disconnected while sending stderr");
+                                return Ok(kill_child_on_disconnect(child));
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(e) => {
@@ -2510,15 +2584,25 @@ fn run_interactive_loop(
         // Read incoming request from host (stdin data, resize) — only when
         // poll confirms data is available, then use blocking read_exact which
         // is safe because the data is already in the kernel buffer.
-        if poll_fds[2].revents & libc::POLLIN != 0 {
+        //
+        // If the host disconnects (client killed, timeout), read_exact returns
+        // an error. In that case, kill the child and return gracefully — the
+        // agent must survive client disconnections.
+        if poll_fds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut header = [0u8; 4];
-            stream.read_exact(&mut header)?;
+            if let Err(e) = stream.read_exact(&mut header) {
+                debug!(error = %e, "host disconnected during interactive exec");
+                return Ok(kill_child_on_disconnect(child));
+            }
             let len = u32::from_be_bytes(header) as usize;
             if len > MAX_MESSAGE_SIZE {
                 return Err(format!("message too large: {} bytes", len).into());
             }
             let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf)?;
+            if let Err(e) = stream.read_exact(&mut buf) {
+                debug!(error = %e, "host disconnected during interactive exec payload");
+                return Ok(kill_child_on_disconnect(child));
+            }
             let request: AgentRequest = serde_json::from_slice(&buf)?;
 
             match request {
@@ -2642,19 +2726,25 @@ fn run_interactive_loop_pty(
             continue;
         }
 
-        // Read available data from PTY master.
+        // Read available data from PTY master. If send_response fails
+        // (host disconnected), kill the child and return gracefully.
         let mut slave_closed = false;
         if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             loop {
                 match pty_master.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        send_response(
+                        if send_response(
                             stream,
                             &AgentResponse::Stdout {
                                 data: buf[..n].to_vec(),
                             },
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            debug!("host disconnected while sending PTY stdout");
+                            return Ok(kill_child_on_disconnect(child));
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -2680,15 +2770,22 @@ fn run_interactive_loop_pty(
 
         // Read incoming request from host — only when poll confirms data
         // is available, then use blocking read_exact (safe, data is buffered).
-        if poll_fds[1].revents & libc::POLLIN != 0 {
+        // If the host disconnects, kill the child and return gracefully.
+        if poll_fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut header = [0u8; 4];
-            stream.read_exact(&mut header)?;
+            if let Err(e) = stream.read_exact(&mut header) {
+                debug!(error = %e, "host disconnected during PTY interactive exec");
+                return Ok(kill_child_on_disconnect(child));
+            }
             let len = u32::from_be_bytes(header) as usize;
             if len > MAX_MESSAGE_SIZE {
                 return Err(format!("message too large: {} bytes", len).into());
             }
             let mut msg_buf = vec![0u8; len];
-            stream.read_exact(&mut msg_buf)?;
+            if let Err(e) = stream.read_exact(&mut msg_buf) {
+                debug!(error = %e, "host disconnected during PTY interactive exec payload");
+                return Ok(kill_child_on_disconnect(child));
+            }
             let request: AgentRequest = serde_json::from_slice(&msg_buf)?;
 
             match request {
@@ -3035,6 +3132,7 @@ fn handle_run(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
 
@@ -3046,6 +3144,7 @@ fn handle_run(
         mounts,
         timeout_ms,
         persistent_overlay_id,
+        client_fd,
     ) {
         Ok(result) => AgentResponse::Completed {
             exit_code: result.exit_code,
@@ -3302,6 +3401,7 @@ fn handle_vm_exec(
     env: &[(String, String)],
     workdir: Option<&str>,
     timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
     info!(command = ?command, "executing directly in VM");
 
@@ -3324,6 +3424,24 @@ fn handle_vm_exec(
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // Put the child in its own process group so we can signal the whole
+    // tree (e.g., `sh -c 'sleep 30'` — killing sh alone leaves sleep
+    // orphaned and holding the stdout pipe, blocking reader threads).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // setsid creates a new session and process group rooted at
+                // this child. killpg(pgid, SIGKILL) later hits all descendants.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     // Spawn the command
     let mut child = match cmd.spawn() {
@@ -3371,9 +3489,35 @@ fn handle_vm_exec(
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
+                // Client disconnected — kill the orphan child so the accept
+                // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
+                // on the host-side exec client used to leave the agent stuck.
+                if let Some(fd) = client_fd {
+                    if process::is_peer_closed(fd) {
+                        warn!(
+                            pid = child.id(),
+                            "client disconnected during VM exec, killing child group"
+                        );
+                        // Kill the entire process group — `sh -c 'sleep 30'`
+                        // creates child processes that inherit the stdout pipe.
+                        // Killing just `sh` leaves `sleep` holding the pipe,
+                        // blocking the reader threads' EOF. killpg hits them all.
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 129; // SIGHUP convention: killed by disconnect
+                    }
+                }
                 if let Some(deadline) = deadline {
                     if std::time::Instant::now() >= deadline {
-                        warn!("VM exec command timed out, killing process");
+                        warn!("VM exec command timed out, killing process group");
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         break 124; // Standard timeout exit code
@@ -3390,7 +3534,8 @@ fn handle_vm_exec(
         }
     };
 
-    // Join reader threads (they'll finish now that the child has exited or been killed)
+    // Join reader threads — they return EOF because the child and all its
+    // descendants in the process group have been killed (pipes closed).
     let stdout = stdout_handle
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())

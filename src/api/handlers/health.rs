@@ -23,20 +23,13 @@ pub fn mark_server_start() {
         (status = 200, description = "Server is healthy", body = HealthResponse)
     )
 )]
-pub async fn health(state: Option<State<Arc<ApiState>>>) -> Json<HealthResponse> {
-    let (machines, uptime) = match state {
-        Some(State(s)) => {
-            let counts = s.machine_counts();
-            (
-                Some(MachineCountsResponse {
-                    total: counts.0,
-                    running: counts.1,
-                }),
-                SERVER_START.get().map(|t| t.elapsed().as_secs()),
-            )
-        }
-        None => (None, None),
-    };
+pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
+    let counts = state.machine_counts();
+    let machines = Some(MachineCountsResponse {
+        total: counts.0,
+        running: counts.1,
+    });
+    let uptime = SERVER_START.get().map(|t| t.elapsed().as_secs());
 
     Json(HealthResponse {
         status: "ok",

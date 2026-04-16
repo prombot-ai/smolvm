@@ -12,6 +12,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
+use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
 // ============================================================================
@@ -300,6 +301,7 @@ pub struct CreateVmParams {
     pub volume: Vec<String>,
     pub port: Vec<PortMapping>,
     pub net: bool,
+    pub network_backend: Option<NetworkBackend>,
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
@@ -317,6 +319,8 @@ pub struct CreateVmParams {
     pub ssh_agent: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Absolute path to .smolmachine sidecar (for machines created with --from).
+    pub source_smolmachine: Option<String>,
 }
 
 /// Create a named machine configuration (does not start it).
@@ -371,6 +375,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.network_backend = params.network_backend;
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();
@@ -381,6 +386,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
+    record.source_smolmachine = params.source_smolmachine.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -449,6 +455,11 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     let ports = record.port_mappings();
     let resources = record.vm_resources();
 
+    // Check for host port conflicts with other running VMs.
+    if !ports.is_empty() {
+        check_port_conflicts(name, &ports, &db)?;
+    }
+
     // Start agent VM
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -480,10 +491,40 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         None
     };
 
-    let features = smolvm::agent::LaunchFeatures {
+    let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
+        packed_layers_dir: None,
+        extra_disks: Vec::new(),
     };
+
+    // If machine was created from .smolmachine, extract layers to cache and
+    // mount via virtiofs so the agent uses pre-extracted layers instead of
+    // pulling from a registry.
+    if let Some(ref sidecar_path) = record.source_smolmachine {
+        let sidecar = std::path::Path::new(sidecar_path);
+        if !sidecar.exists() {
+            return Err(Error::agent(
+                "start machine",
+                format!(
+                    "source .smolmachine not found: {}\nThe file may have been moved or deleted.",
+                    sidecar_path
+                ),
+            ));
+        }
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+            .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
+        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
+            .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+        smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, false, false)
+            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+        let layers_lease = smolvm_pack::extract::acquire_layers_lease(&cache_dir, false)
+            .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+        features.packed_layers_dir = Some(layers_lease.path.clone());
+        // Leak the lease — the volume must stay mounted while the VM runs.
+        // Cleanup happens via `pack prune` or on next `machine start`.
+        std::mem::forget(layers_lease);
+    }
 
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
@@ -504,7 +545,9 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    if let Some(ref image) = record.image {
+    if record.source_smolmachine.is_some() {
+        // Layers already mounted via virtiofs — no pull needed.
+    } else if let Some(ref image) = record.image {
         println!("Pulling {}...", image);
         let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
     }
@@ -602,8 +645,10 @@ pub fn persist_default_running(
                 r.mounts = o.mounts.clone();
                 r.ports = o.ports.clone();
                 r.network = o.network;
+                r.network_backend = o.network_backend;
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
+                r.allowed_cidrs = o.allowed_cidrs.clone();
                 r.init = o.init.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
@@ -611,6 +656,7 @@ pub fn persist_default_running(
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
+                r.dns_filter_hosts = o.dns_filter_hosts.clone();
             }
         })
         .is_none()
@@ -626,8 +672,10 @@ pub struct DefaultVmOverrides {
     pub mounts: Vec<(String, String, bool)>,
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
+    pub network_backend: Option<NetworkBackend>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
+    pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
@@ -635,6 +683,46 @@ pub struct DefaultVmOverrides {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
+    pub dns_filter_hosts: Option<Vec<String>>,
+}
+
+/// Check if any running VM already binds to the same host ports.
+///
+/// Iterates all VM records, skipping the current VM (`self_name`), and checks
+/// for host port overlaps with running VMs. This prevents silent port binding
+/// failures where two VMs claim the same host port but only one succeeds.
+fn check_port_conflicts(
+    self_name: &str,
+    ports: &[PortMapping],
+    db: &SmolvmDb,
+) -> smolvm::Result<()> {
+    let host_ports: std::collections::HashSet<u16> = ports.iter().map(|p| p.host).collect();
+    if host_ports.is_empty() {
+        return Ok(());
+    }
+
+    let all_vms = db.list_vms()?;
+    for (name, record) in &all_vms {
+        if name == self_name {
+            continue;
+        }
+        // Only check running VMs (PID-based quick check).
+        if record.actual_state() != smolvm::config::RecordState::Running {
+            continue;
+        }
+        for (host, _guest) in &record.ports {
+            if host_ports.contains(host) {
+                return Err(smolvm::Error::config(
+                    "start machine",
+                    format!(
+                        "host port {} is already in use by running machine '{}'",
+                        host, name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Start the default machine.
@@ -1017,6 +1105,7 @@ pub fn resize_vm(
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
+    use smolvm::data::disk::{Overlay, Storage};
     use smolvm::db::SmolvmDb;
     use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
@@ -1084,7 +1173,7 @@ pub fn resize_vm(
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
             let storage_path = manager.storage_path();
-            expand_disk(storage_path, storage_gb, "storage")
+            expand_disk::<Storage>(storage_path, storage_gb)
                 .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
             println!(" done");
         }
@@ -1100,7 +1189,7 @@ pub fn resize_vm(
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
             let overlay_path = manager.overlay_path();
-            expand_disk(overlay_path, overlay_gb, "overlay")
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
                 .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
             println!(" done");
         }

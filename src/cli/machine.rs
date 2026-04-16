@@ -20,6 +20,7 @@ use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, V
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
+use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -215,6 +216,15 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(
+        long = "net-backend",
+        value_enum,
+        hide = true,
+        help_heading = "Network"
+    )]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -265,7 +275,7 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let (cli_allow_cidrs, net, dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -282,6 +292,7 @@ impl RunCmd {
             self.volume,
             self.port,
             net,
+            self.net_backend,
             vec![],
             self.env,
             self.workdir,
@@ -291,8 +302,19 @@ impl RunCmd {
             cli_allow_cidrs,
         )?;
 
+        let mut params = params;
+        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
+        PortMapping::check_duplicates(&ports)
+            .map_err(|e| smolvm::Error::config("validate ports", e))?;
 
         if self.docker_config {
             if let Some(docker_mount) = docker_config_mount() {
@@ -304,6 +326,10 @@ impl RunCmd {
 
         // Require an explicit command, -it flag, or Smolfile entrypoint/cmd.
         // Without any of these, /bin/sh hangs waiting for input — confusing UX.
+        if self.detach && (self.interactive || self.tty) {
+            eprintln!("warning: -i/-t flags are ignored in detached mode (-d)");
+        }
+
         let has_smolfile_command = !params.entrypoint.is_empty() || !params.cmd.is_empty();
         let (interactive, tty) = if !self.interactive
             && !self.tty
@@ -325,10 +351,16 @@ impl RunCmd {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
+            network_backend: params.network_backend,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
+        validate_requested_network_backend(
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        )?;
 
         let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -356,7 +388,9 @@ impl RunCmd {
 
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
-            dns_filter_hosts,
+            dns_filter_hosts: params.dns_filter_hosts.clone(),
+            packed_layers_dir: None,
+            extra_disks: Vec::new(),
         };
 
         let freshly_started = manager
@@ -386,11 +420,21 @@ impl RunCmd {
 
         // Pull image if one is specified
         let image_info = if let Some(ref img) = image {
-            Some(crate::cli::pull_with_progress(
-                &mut client,
-                img,
-                self.oci_platform.as_deref(),
-            )?)
+            match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
+                Ok(info) => Some(info),
+                Err(e) if !params.net => {
+                    // Add a hint when pull fails and networking is disabled —
+                    // this is the most common user error.
+                    return Err(smolvm::Error::agent(
+                        "pull image",
+                        format!(
+                            "{}\n\nHint: networking is disabled. Add --net to enable image pulls:\n  smolvm machine run --net --image {} ...",
+                            e, img
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
@@ -506,8 +550,10 @@ impl RunCmd {
                                 mounts: mount_tuples,
                                 ports: port_tuples,
                                 network: params.net,
+                                network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
+                                allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
@@ -515,6 +561,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
+                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -612,8 +659,10 @@ impl RunCmd {
                                 mounts: mount_tuples,
                                 ports: port_tuples,
                                 network: params.net,
+                                network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
+                                allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
@@ -621,6 +670,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
+                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -648,7 +698,7 @@ impl RunCmd {
                     )?
                 } else {
                     let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), None)?;
+                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
                     if !stdout.is_empty() {
                         print!("{}", stdout);
                     }
@@ -719,14 +769,32 @@ impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
 
+        // Detach immediately — exec never owns the VM lifecycle. Without this,
+        // any early return (failed exec, timeout, client signal) triggers
+        // AgentManager::Drop which calls stop() and kills the VM.
+        manager.detach();
+
         let env = parse_env_list(&self.env);
+
+        // Load machine record for workdir and image info
+        let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+        let record = smolvm::db::SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&name).ok().flatten());
+
+        // Resolve workdir: CLI --workdir flag takes priority over Smolfile/machine config
+        let workdir = self
+            .workdir
+            .clone()
+            .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
+        let record_image = record.as_ref().and_then(|r| r.image.clone());
 
         // Streaming mode — print output as it arrives, no buffering
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
                 env,
-                self.workdir.clone(),
+                workdir.clone(),
                 self.timeout,
             )?;
             let mut exit_code = 0;
@@ -751,44 +819,36 @@ impl ExecCmd {
                     }
                 }
             }
-            manager.detach();
             std::process::exit(exit_code);
         }
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
-        let machine_name = self.name.clone().unwrap_or_else(|| "default".to_string());
-        let (record_image, mount_bindings) = {
-            smolvm::db::SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-                .map(|r| {
-                    let bindings = mounts_to_virtiofs_bindings(&r.host_mounts());
-                    (r.image.clone(), bindings)
-                })
-                .unwrap_or((None, vec![]))
-        };
+        let mount_bindings = record
+            .as_ref()
+            .map(|r| mounts_to_virtiofs_bindings(&r.host_mounts()))
+            .unwrap_or_default();
 
         if let Some(ref image) = record_image {
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
+            let machine_name = name.clone();
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(env)
-                    .with_workdir(self.workdir.clone())
+                    .with_workdir(workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
                     .with_persistent_overlay(Some(machine_name.clone()));
                 let exit_code = client.run_interactive(config)?;
-                manager.detach();
                 std::process::exit(exit_code);
             }
 
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                 .with_env(env)
-                .with_workdir(self.workdir.clone())
+                .with_workdir(workdir.clone())
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));
@@ -800,20 +860,15 @@ impl ExecCmd {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
                     env,
-                    self.workdir.clone(),
+                    workdir.clone(),
                     self.timeout,
                     self.tty,
                 )?;
-                manager.detach();
                 std::process::exit(exit_code);
             }
 
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                self.command.clone(),
-                env,
-                self.workdir.clone(),
-                self.timeout,
-            )?;
+            let (exit_code, stdout, stderr) =
+                client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
     }
@@ -870,6 +925,10 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -901,11 +960,21 @@ pub struct CreateCmd {
     /// Load configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
+
+    /// Create machine from a packed .smolmachine artifact.
+    /// Uses pre-extracted layers instead of pulling from a registry.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
+    pub from: Option<PathBuf>,
 }
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (cli_allow_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
+        // Branch for --from: create machine from .smolmachine artifact.
+        if let Some(ref sidecar_path) = self.from {
+            return self.run_from_smolmachine(sidecar_path);
+        }
+
+        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -926,6 +995,7 @@ impl CreateCmd {
             self.volume,
             self.port,
             net,
+            self.net_backend,
             self.init,
             self.env,
             self.workdir,
@@ -935,9 +1005,118 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        let resources = VmResources {
+            cpus: params.cpus,
+            memory_mib: params.mem,
+            network: params.net,
+            network_backend: params.network_backend,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+        };
+        validate_requested_network_backend(
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        )?;
         if self.ssh_agent {
             params.ssh_agent = true;
         }
+        PortMapping::check_duplicates(&params.port)
+            .map_err(|e| smolvm::Error::config("validate ports", e))?;
+        vm_common::create_vm(params)
+    }
+
+    /// Create a machine from a .smolmachine artifact.
+    fn run_from_smolmachine(&self, sidecar_path: &std::path::Path) -> smolvm::Result<()> {
+        use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+
+        if !sidecar_path.exists() {
+            return Err(smolvm::Error::config(
+                "create from .smolmachine",
+                format!("file not found: {}", sidecar_path.display()),
+            ));
+        }
+
+        // Read manifest from the sidecar to get image metadata.
+        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
+            .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
+
+        // Pre-extract the sidecar so first `machine start` is fast.
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
+            .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
+        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
+            .map_err(|e| smolvm::Error::agent("get cache dir", e.to_string()))?;
+        println!("Extracting .smolmachine assets...");
+        smolvm_pack::extract::extract_sidecar(sidecar_path, &cache_dir, &footer, false, false)
+            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))?;
+
+        // Resolve the canonical path for storage in VmRecord.
+        let canonical_path = sidecar_path
+            .canonicalize()
+            .unwrap_or_else(|_| sidecar_path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(smolvm::util::generate_machine_name);
+
+        // CLI flags override manifest defaults.
+        let cpus = if self.cpus != DEFAULT_MICROVM_CPU_COUNT {
+            self.cpus
+        } else {
+            manifest.cpus
+        };
+        let mem = if self.mem != DEFAULT_MICROVM_MEMORY_MIB {
+            self.mem
+        } else {
+            manifest.mem
+        };
+
+        let params = vm_common::CreateVmParams {
+            name,
+            image: Some(manifest.image),
+            entrypoint: manifest.entrypoint,
+            cmd: manifest.cmd,
+            cpus,
+            mem,
+            volume: self.volume.clone(),
+            port: self.port.clone(),
+            net: self.net || manifest.network,
+            network_backend: self.net_backend,
+            init: self.init.clone(),
+            env: {
+                let mut env = manifest.env;
+                env.extend(self.env.iter().cloned());
+                env
+            },
+            workdir: manifest.workdir,
+            storage_gb: self.storage,
+            overlay_gb: self.overlay,
+            allowed_cidrs: None,
+            restart_policy: None,
+            restart_max_retries: None,
+            restart_max_backoff_secs: None,
+            health_cmd: None,
+            health_interval_secs: None,
+            health_timeout_secs: None,
+            health_retries: None,
+            health_startup_grace_secs: None,
+            ssh_agent: self.ssh_agent,
+            dns_filter_hosts: None,
+            source_smolmachine: Some(canonical_path),
+        };
+
         vm_common::create_vm(params)
     }
 }
@@ -958,10 +1137,15 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
         match vm_common::start_vm_named(&name) {
             Ok(()) => Ok(()),
-            Err(smolvm::Error::VmNotFound { .. }) => vm_common::start_vm_default(),
+            Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
+                // Only fall back to creating a default VM when no --name was given.
+                // With an explicit --name, VmNotFound is a real error.
+                vm_common::start_vm_default()
+            }
             Err(e) => Err(e),
         }
     }
@@ -1106,7 +1290,19 @@ impl ResizeCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         let name_str = name.as_deref().unwrap_or("default");
 
-        vm_common::resize_vm(name_str, self.storage, self.overlay)
+        vm_common::resize_vm(name_str, self.storage, self.overlay).map_err(|e| {
+            if matches!(&e, smolvm::Error::InvalidState { .. }) {
+                smolvm::Error::agent(
+                    "resize",
+                    format!(
+                        "VM '{}' is running. Stop it first with: smolvm machine stop --name {}",
+                        name_str, name_str
+                    ),
+                )
+            } else {
+                e
+            }
+        })
     }
 }
 

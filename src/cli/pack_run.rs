@@ -16,6 +16,7 @@ use smolvm::agent::launcher_dynamic::{
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
+use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -162,6 +163,15 @@ pub struct PackRunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(
+        long = "net-backend",
+        value_enum,
+        hide = true,
+        help_heading = "Network"
+    )]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -235,32 +245,7 @@ impl PackRunCmd {
 
         // 4. Handle --info: show manifest and exit
         if self.info {
-            let mode_str = match manifest.mode {
-                PackMode::Container => "container",
-                PackMode::Vm => "vm",
-            };
-            println!("Mode:       {}", mode_str);
-            println!("Image:      {}", manifest.image);
-            println!("Digest:     {}", manifest.digest);
-            println!("Platform:   {}", manifest.platform);
-            println!("CPUs:       {}", manifest.cpus);
-            println!("Memory:     {} MiB", manifest.mem);
-            if !manifest.entrypoint.is_empty() {
-                println!("Entrypoint: {}", manifest.entrypoint.join(" "));
-            }
-            if !manifest.cmd.is_empty() {
-                println!("Cmd:        {}", manifest.cmd.join(" "));
-            }
-            if let Some(ref wd) = manifest.workdir {
-                println!("Workdir:    {}", wd);
-            }
-            if !manifest.env.is_empty() {
-                println!("Env:");
-                for e in &manifest.env {
-                    println!("  {}", e);
-                }
-            }
-            println!("Checksum:   {:08x}", footer.checksum);
+            print_manifest_info(&manifest, footer.checksum);
             return Ok(());
         }
 
@@ -283,7 +268,9 @@ impl PackRunCmd {
         //    directory that survives PID reuse and abrupt termination.
         let rootfs_path = cache_dir.join("agent-rootfs");
         let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
-        let layers_dir = cache_dir.join("layers");
+        let layers_lease = extract::acquire_layers_lease(&cache_dir, self.debug)
+            .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+        let layers_dir = &layers_lease.path;
         let runtime_parent = cache_dir.join("runtime");
         std::fs::create_dir_all(&runtime_parent)
             .map_err(|e| Error::agent("create runtime parent", e.to_string()))?;
@@ -293,13 +280,17 @@ impl PackRunCmd {
         let storage_path = runtime_dir.path().join("storage.ext4");
         let vsock_path = runtime_dir.path().join("agent.sock");
 
+        // Compute auto-sized storage before creating the disk so both the
+        // disk file and VmResources use the same value.
+        let storage_gib = storage_gib_for_manifest(self.storage, &manifest);
+
         // Create storage disk (each invocation gets its own copy)
         let template = manifest
             .assets
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, self.storage)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         let overlay_runtime_path = setup_vm_overlay(
@@ -316,11 +307,13 @@ impl PackRunCmd {
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || !self.port.is_empty(),
-            storage_gib: storage_gib_for_manifest(self.storage, &manifest),
+            network: self.net || manifest.network || !self.port.is_empty(),
+            network_backend: self.net_backend,
+            storage_gib,
             overlay_gib: self.overlay,
             allowed_cidrs: None,
         };
+        validate_requested_network_backend(&resources, None, self.port.len())?;
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -355,7 +348,7 @@ impl PackRunCmd {
                 rootfs_path: &rootfs_path,
                 storage_path: &storage_path,
                 vsock_socket: &vsock_path_clone,
-                layers_dir: &layers_dir,
+                layers_dir,
                 mounts: &packed_mounts,
                 port_mappings: &port_mappings,
                 resources,
@@ -433,6 +426,7 @@ impl PackRunCmd {
 
         // std::process::exit skips destructors, so drop explicitly first.
         drop(child_guard);
+        drop(layers_lease); // releases layers volume lease (detaches if last)
         std::process::exit(exit_code);
     }
 }
@@ -694,7 +688,7 @@ fn execute_command(
         tty: args.tty,
         timeout: args.timeout,
     };
-    execute_packed_command(client, manifest, params, mounts)
+    execute_packed_command(client, manifest, params, mounts, None)
 }
 
 /// Resolved execution parameters for a packed command.
@@ -714,6 +708,7 @@ fn execute_packed_command(
     manifest: &smolvm_pack::PackManifest,
     params: ExecParams,
     mounts: &[smolvm::data::storage::HostMount],
+    persistent_overlay_id: Option<String>,
 ) -> smolvm::Result<i32> {
     let ExecParams {
         command,
@@ -751,14 +746,16 @@ fn execute_packed_command(
                     .with_workdir(workdir)
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
-                    .with_tty(tty);
+                    .with_tty(tty)
+                    .with_persistent_overlay(persistent_overlay_id.clone());
                 client.run_interactive(config)
             } else {
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_mounts(mount_bindings)
-                    .with_timeout(timeout);
+                    .with_timeout(timeout)
+                    .with_persistent_overlay(persistent_overlay_id);
                 let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
 
                 if !stdout.is_empty() {
@@ -856,6 +853,10 @@ struct PackedRunArgs {
     #[arg(long)]
     net: bool,
 
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    net_backend: Option<NetworkBackend>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -903,6 +904,10 @@ struct PackedStartArgs {
     /// Enable outbound network access
     #[arg(long)]
     net: bool,
+
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    net_backend: Option<NetworkBackend>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1029,6 +1034,7 @@ fn run_ephemeral(
                 volume: args.volume,
                 port: args.port,
                 net: args.net,
+                net_backend: args.net_backend,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1122,7 +1128,9 @@ fn run_from_cache(
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(cache_dir, debug)?;
-    let layers_dir = cache_dir.join("layers");
+    let layers_lease = extract::acquire_layers_lease(cache_dir, debug)
+        .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+    let layers_dir = &layers_lease.path;
     let runtime_parent = cache_dir.join("runtime");
     std::fs::create_dir_all(&runtime_parent)
         .map_err(|e| Error::agent("create runtime parent", e.to_string()))?;
@@ -1132,12 +1140,14 @@ fn run_from_cache(
     let storage_path = runtime_dir.path().join("storage.ext4");
     let vsock_path = runtime_dir.path().join("agent.sock");
 
+    let storage_gib = storage_gib_for_manifest(args.storage, manifest);
+
     let template = manifest
         .assets
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, args.storage)
+    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, storage_gib)
         .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
@@ -1149,15 +1159,16 @@ fn run_from_cache(
 
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
-
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || !args.port.is_empty(),
-        storage_gib: storage_gib_for_manifest(args.storage, manifest),
+        network: args.net || manifest.network || !args.port.is_empty(),
+        network_backend: args.net_backend,
+        storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1178,7 +1189,7 @@ fn run_from_cache(
             rootfs_path: &rootfs_path,
             storage_path: &storage_path,
             vsock_socket: &vsock_path_clone,
-            layers_dir: &layers_dir,
+            layers_dir,
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,
@@ -1238,9 +1249,10 @@ fn run_from_cache(
         tty: args.tty,
         timeout: args.timeout,
     };
-    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts)?;
+    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts, None)?;
 
     drop(child_guard);
+    drop(layers_lease);
     std::process::exit(exit_code);
 }
 
@@ -1255,6 +1267,9 @@ fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
     println!("Platform:   {}", manifest.platform);
     println!("CPUs:       {}", manifest.cpus);
     println!("Memory:     {} MiB", manifest.mem);
+    if manifest.network {
+        println!("Network:    enabled");
+    }
     if !manifest.entrypoint.is_empty() {
         println!("Entrypoint: {}", manifest.entrypoint.join(" "));
     }
@@ -1441,6 +1456,7 @@ fn daemon_start(
     }
 
     // Create storage disk if not exists (preserves existing disk on restart)
+    let storage_gib = storage_gib_for_manifest(args.storage, &manifest);
     let storage_path = daemon.join("storage.ext4");
     if !storage_path.exists() {
         let template = manifest
@@ -1448,7 +1464,7 @@ fn daemon_start(
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, args.storage)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
@@ -1466,21 +1482,29 @@ fn daemon_start(
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
-
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || !args.port.is_empty(),
-        storage_gib: storage_gib_for_manifest(args.storage, &manifest),
+        network: args.net || manifest.network || !args.port.is_empty(),
+        network_backend: args.net_backend,
+        storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(&cache_dir, debug)?;
-    let layers_dir = cache_dir.join("layers");
+    // Use a temporary RAII lease to mount the volume for the launch config.
+    // The persistent daemon lease is created after fork with the real child
+    // PID. If fork fails, the RAII lease cleans up normally. If fork
+    // succeeds, the daemon lease keeps the volume mounted after the RAII
+    // lease drops.
+    let layers_lease = extract::acquire_layers_lease(&cache_dir, debug)
+        .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+    let layers_dir = layers_lease.path.clone();
 
     if debug {
         eprintln!("debug: daemon dir={}", daemon.display());
@@ -1561,6 +1585,12 @@ fn daemon_start(
     // Write PID file
     write_daemon_pid(checksum, child_pid, child_start_time)?;
 
+    // Create the persistent daemon lease with the real child PID.
+    // This must happen before the RAII layers_lease drops — otherwise the
+    // volume would be detached between Drop and this call.
+    extract::acquire_daemon_lease(&cache_dir, child_pid, debug)
+        .map_err(|e| Error::agent("acquire daemon lease", e.to_string()))?;
+
     if debug {
         eprintln!("debug: forked VM process with PID {}", child_pid);
     }
@@ -1610,7 +1640,11 @@ fn daemon_exec(
         timeout: args.timeout,
     };
 
-    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts)?;
+    // Daemon exec uses a persistent overlay so filesystem changes (package
+    // installs, config writes) survive across exec calls, matching the
+    // behavior of `machine exec` on persistent machines.
+    let overlay_id = Some("daemon".to_string());
+    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts, overlay_id)?;
 
     std::process::exit(exit_code);
 }
@@ -1664,6 +1698,12 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
     if let Err(e) = std::fs::remove_file(dir.join("agent.sock")) {
         tracing::debug!(error = %e, "cleanup: remove daemon socket");
     }
+
+    // Release the persistent daemon lease. Detaches the case-sensitive
+    // volume if no other leases remain.
+    let cache_dir = extract::get_cache_dir(checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+    extract::release_daemon_lease(&cache_dir);
 
     println!("Daemon stopped");
     Ok(())

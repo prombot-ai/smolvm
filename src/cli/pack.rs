@@ -245,6 +245,7 @@ impl PackCreateCmd {
                 cpus: 4,
                 memory_mib: 8192,
                 network: true,
+                network_backend: None,
                 storage_gib: None,
                 overlay_gib: None,
                 allowed_cidrs: None,
@@ -275,26 +276,99 @@ impl PackCreateCmd {
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
         self.collect_base_assets(&mut collector)?;
 
-        // Export and collect layers
-        println!("Exporting {} layers...", image_info.layer_count);
-        for (i, layer_digest) in image_info.layers.iter().enumerate() {
-            let prefix = format!(
-                "  Layer {}/{}: {}",
-                i + 1,
-                image_info.layer_count,
-                &layer_digest[..19]
-            );
+        // Export layers. For images with many layers (e.g., rocker/tidyverse
+        // has 20), we pre-merge all layers into a single directory in the VM
+        // so the packed binary has one lowerdir at runtime. Without this, the
+        // overlayfs multi-lowerdir mount fails on virtiofs-backed layers and
+        // falls back to a 15-second physical merge on every first exec.
+        if image_info.layer_count <= 1 {
+            // Single layer — export directly, no merge needed.
+            let layer_digest = &image_info.layers[0];
+            let prefix = format!("  Layer 1/1: {}", &layer_digest[..19]);
             print!("{}...", prefix);
             let _ = std::io::Write::flush(&mut std::io::stdout());
-
-            // Export layer via agent — streamed directly to staging disk (zero memory buffering)
             let layer_file = collector.layer_staging_path(layer_digest);
-            self.export_layer_to_file(&mut client, &image_info.digest, i, &layer_file, &prefix)?;
-
-            // Register the already-written file in the collector's inventory
+            self.export_layer_to_file(&mut client, &image_info.digest, 0, &layer_file, &prefix)?;
             collector
                 .register_layer(layer_digest)
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
+        } else {
+            // Multiple layers — merge in the VM so runtime gets a single
+            // lowerdir that always mounts instantly.
+            println!(
+                "Merging {} layers in VM (one-time cost)...",
+                image_info.layer_count
+            );
+
+            // Build the merge command: extract each layer in order (bottom
+            // first), then tar the result. Layer order in image_info.layers
+            // is bottom-to-top, which is the correct copy order.
+            let layer_paths: Vec<String> = image_info
+                .layers
+                .iter()
+                .map(|d| {
+                    let id = d.strip_prefix("sha256:").unwrap_or(d);
+                    format!("/storage/layers/{}", id)
+                })
+                .collect();
+
+            // Copy layers bottom-up into /tmp/merged, then tar
+            let mut merge_script = String::from("set -e\nmkdir -p /tmp/merged\n");
+            for (i, layer_path) in layer_paths.iter().enumerate() {
+                // cp -a preserves symlinks, permissions, ownership.
+                // Ignore exit code: cp may fail on device files or sockets
+                // that can't be copied, but the layer content is intact.
+                // Redirect stderr so warnings are visible in the output.
+                merge_script.push_str(&format!(
+                    "echo 'Merging layer {}/{}...'\n\
+                     cp -a {}/. /tmp/merged/ || true\n",
+                    i + 1,
+                    image_info.layer_count,
+                    layer_path
+                ));
+            }
+            // Verify disk space wasn't exhausted during merge
+            merge_script.push_str(
+                "if ! df /tmp/merged | awk 'NR==2{if($4<1024){exit 1}}'; then\n\
+                 echo 'MERGE_FAIL: disk full'; exit 1\nfi\n\
+                 echo 'Creating merged tar...'\n\
+                 tar cf /tmp/merged-layers.tar -C /tmp/merged .\n\
+                 echo 'MERGE_OK'\n",
+            );
+
+            let (exit_code, stdout, stderr) = client.vm_exec(
+                vec!["sh".to_string(), "-c".to_string(), merge_script],
+                vec![],
+                None,
+                None,
+            )?;
+
+            if exit_code != 0 || !stdout.contains("MERGE_OK") {
+                return Err(Error::agent(
+                    "merge layers",
+                    format!(
+                        "layer merge failed (exit {}): {}",
+                        exit_code,
+                        if stderr.is_empty() { &stdout } else { &stderr }
+                    ),
+                ));
+            }
+
+            // Download the merged tar — streamed to disk (16 MB chunks,
+            // never holds the full tar in memory).
+            print!("  Exporting merged layer...");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let merged_digest = format!("sha256:merged-{}", &image_info.digest[..16]);
+            let merged_file = collector.layer_staging_path(&merged_digest);
+
+            let total_bytes = client
+                .read_file_to_path("/tmp/merged-layers.tar", &merged_file, |_| {})
+                .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
+            println!(" {} MB done", total_bytes / (1024 * 1024));
+
+            collector
+                .register_layer(&merged_digest)
+                .map_err(|e| Error::agent("register merged layer", e.to_string()))?;
         }
 
         // Stop agent and clean up temp VM data. Propagates stop errors
@@ -309,6 +383,7 @@ impl PackCreateCmd {
         manifest.image_size = image_info.size;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
+        manifest.network = pack_config.net.unwrap_or(false);
 
         // Start with OCI image config as baseline
         manifest.entrypoint = image_info.entrypoint.clone();
@@ -385,12 +460,164 @@ impl PackCreateCmd {
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
-        // 4. Collect base assets + overlay template
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
-        self.collect_base_assets(&mut collector)?;
 
-        // Add overlay template from VM
+        let is_image_based = vm.image.is_some();
+
+        // 4. For image-based VMs, export OCI layers + container overlay via temp VM.
+        // The container overlay (installed packages) lives inside the VM's ext4
+        // storage disk which can't be read on macOS — a temp VM mounts it for us.
+        if is_image_based {
+            let image = vm.image.clone().unwrap();
+            let storage_path = smolvm::agent::vm_data_dir(&vm_name).join("storage.raw");
+
+            self.collect_base_assets(&mut collector)?;
+
+            // Start temp VM with source VM's storage disk attached as an extra
+            // virtio-blk device. virtiofs can only share directories, not files,
+            // so we pass the ext4 disk image as a third block device (/dev/vdc).
+            let pack_vm_name = format!(
+                "__pack_fromvm_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
+
+            println!("Starting agent VM to export layers...");
+            let manager = AgentManager::for_vm(&pack_vm_name)?;
+            let features = smolvm::agent::LaunchFeatures {
+                extra_disks: vec![(storage_path.clone(), false)],
+                ..Default::default()
+            };
+            manager.start_with_full_config(
+                Vec::new(),
+                Vec::new(),
+                VmResources {
+                    cpus: 4,
+                    memory_mib: 8192,
+                    network: true,
+                    network_backend: None,
+                    storage_gib: None,
+                    overlay_gib: None,
+                    allowed_cidrs: None,
+                },
+                features,
+            )?;
+
+            // Closure ensures the temp VM is always stopped, even on early errors
+            // (pull failure, export failure, etc.). Export errors propagate; stop
+            // failures are logged but don't mask the original error.
+            let export_result: smolvm::Result<()> = (|| {
+                let mut client = manager.connect()?;
+
+                // Mount the source VM's storage disk inside the guest.
+                // It appears as /dev/vdc (3rd block device after storage + overlay).
+                let (exit_code, _, stderr) = client.vm_exec(
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
+                            .to_string(),
+                    ],
+                    vec![],
+                    None,
+                    None,
+                )?;
+                if exit_code != 0 {
+                    return Err(Error::agent(
+                        "mount source storage in temp VM",
+                        format!("mount failed (exit {}): {}", exit_code, stderr),
+                    ));
+                }
+
+                // Pull the same image (layers are cached on the source storage,
+                // but the agent needs the manifest to know the layer list).
+                let image_info = crate::cli::pull_with_progress(&mut client, &image, None)?;
+
+                // Export base image layers
+                println!("Exporting {} layers...", image_info.layer_count);
+                for (i, layer_digest) in image_info.layers.iter().enumerate() {
+                    let prefix = format!(
+                        "  Layer {}/{}: {}",
+                        i + 1,
+                        image_info.layer_count,
+                        &layer_digest[..std::cmp::min(19, layer_digest.len())]
+                    );
+                    print!("{}...", prefix);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let layer_file = collector.layer_staging_path(layer_digest);
+                    self.export_layer_to_file(
+                        &mut client,
+                        &image_info.digest,
+                        i,
+                        &layer_file,
+                        &prefix,
+                    )?;
+                    collector
+                        .register_layer(layer_digest)
+                        .map_err(|e| Error::agent("collect layers", e.to_string()))?;
+                }
+
+                // Export the container overlay upper dir as an additional layer.
+                // The source VM's storage disk is mounted at /mnt/source-storage.
+                let overlay_dir =
+                    format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
+                println!("Exporting container overlay...");
+                let overlay_digest = format!("sha256:overlay-{}", vm_name);
+                let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
+
+                // Use the agent to tar the overlay dir
+                let (exit_code, _, stderr) = client.vm_exec(
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "if [ -d '{}' ] && [ \"$(ls -A '{}')\" ]; then \
+                             tar cf /tmp/overlay-export.tar -C '{}' . 2>/dev/null; \
+                             echo OVERLAY_OK; \
+                             else echo OVERLAY_EMPTY; fi",
+                            overlay_dir, overlay_dir, overlay_dir
+                        ),
+                    ],
+                    vec![],
+                    None,
+                    None,
+                )?;
+
+                if exit_code == 0 {
+                    // Download the tar from the temp VM
+                    let tar_data = client.read_file("/tmp/overlay-export.tar")?;
+                    if !tar_data.is_empty() {
+                        std::fs::write(&overlay_layer_file, &tar_data)
+                            .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
+                        collector
+                            .register_layer(&overlay_digest)
+                            .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
+                        println!("  Overlay layer: {} bytes", tar_data.len());
+                    }
+                } else {
+                    tracing::debug!(stderr = %stderr, "overlay export: no container changes found");
+                }
+
+                Ok(())
+            })();
+
+            // Always stop the temp VM and clean up
+            if let Err(e) = manager.stop() {
+                warn!(error = %e, "failed to stop pack temp VM");
+            }
+            let _ = std::fs::remove_dir_all(&vm_data);
+            export_result?;
+        } else {
+            // Bare VM: just collect base assets, no layers needed.
+            self.collect_base_assets(&mut collector)?;
+        }
+
+        // Add overlay template from VM (bare VM rootfs state)
         println!("Copying overlay disk ({})...", overlay_path.display());
         collector
             .add_overlay_template(&overlay_path)
@@ -416,9 +643,16 @@ impl PackCreateCmd {
             platform,
             host_platform,
         );
-        manifest.mode = PackMode::Vm;
+        if is_image_based {
+            manifest.mode = PackMode::Container;
+            manifest.image = vm.image.clone().unwrap_or_default();
+        } else {
+            manifest.mode = PackMode::Vm;
+        }
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
+        // Smolfile > source VM record > default
+        manifest.network = pack_config.net.unwrap_or(vm.network);
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {
@@ -953,6 +1187,12 @@ impl PackPruneCmd {
         let mut removed: usize = 0;
 
         for (path, _, size) in to_remove {
+            // Skip caches that have active leases (running VMs or daemons).
+            if smolvm_pack::extract::has_active_leases(path) {
+                println!("  skipping in-use cache: {} (active lease)", path.display());
+                continue;
+            }
+
             if self.dry_run {
                 println!(
                     "  would remove: {} ({})",
@@ -960,6 +1200,9 @@ impl PackPruneCmd {
                     crate::cli::format_bytes(*size)
                 );
             } else {
+                // Detach any mounted case-sensitive volume before removing.
+                // Safe because we verified no active leases above.
+                smolvm_pack::extract::force_detach_layers_volume(path);
                 if let Err(e) = std::fs::remove_dir_all(path) {
                     tracing::warn!(error = %e, path = %path.display(), "failed to remove {}", label);
                     continue;

@@ -8,6 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
 // Re-export from the library
@@ -40,6 +41,7 @@ pub fn build_create_params(
     cli_volume: Vec<String>,
     cli_port: Vec<PortMapping>,
     cli_net: bool,
+    cli_network_backend: Option<NetworkBackend>,
     cli_init: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
@@ -64,6 +66,7 @@ pub fn build_create_params(
                 volume: cli_volume,
                 port: cli_port,
                 net,
+                network_backend: cli_network_backend,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
@@ -80,6 +83,7 @@ pub fn build_create_params(
                 health_startup_grace_secs: None,
                 ssh_agent: false,
                 dns_filter_hosts: None,
+                source_smolmachine: None,
             });
         }
     };
@@ -251,6 +255,7 @@ pub fn build_create_params(
         volume: volumes,
         port: ports,
         net,
+        network_backend: cli_network_backend,
         init,
         env,
         workdir,
@@ -271,6 +276,7 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        source_smolmachine: None,
     })
 }
 
@@ -292,6 +298,12 @@ pub struct PackConfig {
     pub env: Vec<String>,
     /// Resolved working directory.
     pub workdir: Option<String>,
+    /// Whether outbound networking is enabled.
+    /// `None` = unspecified (caller decides default), `Some(true)` = explicitly
+    /// enabled, `Some(false)` = explicitly disabled. This tri-state is needed
+    /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
+    /// Smolfile, fall back to source VM's setting".
+    pub net: Option<bool>,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -327,6 +339,7 @@ pub fn resolve_pack_config(
                 oci_platform: cli_oci_platform,
                 env: vec![],
                 workdir: None,
+                net: None,
             });
         }
     };
@@ -378,5 +391,19 @@ pub fn resolve_pack_config(
         oci_platform,
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
+        // [network].allow_hosts / allow_cidrs implies net = true,
+        // matching the same logic in build_create_params().
+        // Preserve the tri-state: None = unspecified, Some = explicit.
+        net: {
+            let network_section_implies_net = sf
+                .network
+                .as_ref()
+                .is_some_and(|n| !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty());
+            if network_section_implies_net {
+                Some(true)
+            } else {
+                sf.net // None if key absent, Some(true/false) if explicit
+            }
+        },
     })
 }
