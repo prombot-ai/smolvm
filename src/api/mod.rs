@@ -6,8 +6,11 @@
 //! # Example
 //!
 //! ```bash
-//! # Start the server
-//! smolvm serve --listen 127.0.0.1:8080
+//! # Start the server on the default Unix socket
+//! smolvm serve start
+//!
+//! # Or start the server on TCP explicitly
+//! smolvm serve start --listen 127.0.0.1:8080
 //!
 //! # Create a machine
 //! curl -X POST http://localhost:8080/api/v1/machines \
@@ -24,7 +27,7 @@ pub mod types;
 
 use axum::{
     extract::Request,
-    http::HeaderValue,
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post, put},
@@ -139,30 +142,31 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
     // SSE logs route (no timeout - streams indefinitely)
-    let logs_route = Router::new().route("/:id/logs", get(handlers::exec::stream_logs));
+    let logs_route = Router::new().route("/{id}/logs", get(handlers::exec::stream_logs));
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()
         .route("/", post(handlers::machines::create_machine))
         .route("/", get(handlers::machines::list_machines))
-        .route("/:id", get(handlers::machines::get_machine))
-        .route("/:id/start", post(handlers::machines::start_machine))
-        .route("/:id/stop", post(handlers::machines::stop_machine))
-        .route("/:id", delete(handlers::machines::delete_machine))
+        .route("/{id}", get(handlers::machines::get_machine))
+        .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes
-        .route("/:id/exec", post(handlers::exec::exec_command))
-        .route("/:id/exec/stream", post(handlers::exec::exec_stream))
-        .route("/:id/run", post(handlers::exec::run_command))
+        .route("/{id}/exec", post(handlers::exec::exec_command))
+        .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
+        .route("/{id}/run", post(handlers::exec::run_command))
         // File I/O routes
-        .route("/:id/files/*path", put(handlers::files::upload_file))
-        .route("/:id/files/*path", get(handlers::files::download_file))
+        .route("/{id}/files/{*path}", put(handlers::files::upload_file))
+        .route("/{id}/files/{*path}", get(handlers::files::download_file))
         // Image routes
-        .route("/:id/images", get(handlers::images::list_images))
-        .route("/:id/images/pull", post(handlers::images::pull_image))
+        .route("/{id}/images", get(handlers::images::list_images))
+        .route("/{id}/images/pull", post(handlers::images::pull_image))
         // Apply timeout only to these routes
-        .layer(TimeoutLayer::new(Duration::from_secs(
-            API_REQUEST_TIMEOUT_SECS,
-        )));
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
+        ));
 
     // Machine routes
     let machine_routes = Router::new()
