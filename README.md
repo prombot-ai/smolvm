@@ -151,6 +151,7 @@ Known Limitations
 * Volume mounts: directories only (no single files).
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
+* GPU support is currently being worked on [in a separate branch](https://github.com/smol-machines/smolvm/tree/binbin-gpu-support).
 
 Development
 -----------
