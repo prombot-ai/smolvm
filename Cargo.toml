@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/smolvm-agent",
+    "crates/smolvm-network",
     "crates/smolvm-napi",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
@@ -29,6 +30,7 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+smolvm-network = { path = "crates/smolvm-network" }
 smolvm-protocol = { path = "crates/smolvm-protocol" }
 smolvm-pack = { path = "crates/smolvm-pack" }
 smolvm-registry = { path = "crates/smolvm-registry" }
